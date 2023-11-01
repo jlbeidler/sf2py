@@ -1,0 +1,56 @@
+{
+    "name": "HMS 2020 Midwest Crops v1",
+    "clump_method": "hms",
+    "assoc_method": "hms",
+    "probability_method": "default",
+    "fire_type_method": "timeperiod",
+    "granularity": 1,
+    "input": {
+        "filename": "/work/EMIS/users/bte/WO270.1_2020/sf2_input/hms/hms_2020_fccscdl_mwcrops.csv",
+        "geometry_type": "point",
+        "ingest_method": "sat",
+        "new_data_policy": "replace",
+        "fields": {
+            "start_date": "YearDay",
+            "end_date": "",
+            "area": "",
+            "fire_type": "",
+            "fire_id" : "",
+            "fire_name": "",
+            "lat": "Lat",
+            "lon": "Lon"
+        }
+    },
+    "reconciliation": {
+        "detection_rate": 0.5,
+        "false_alarm_rate": 0.1,
+        "location_weight": 0.9,
+        "size_weight": 0.3,
+        "shape_weight": 0.5,
+        "growth_weight": 0.6,
+        "start_date_uncertainty": 6,
+        "end_date_uncertainty": 5,
+        "name_weight": 0.1,
+        "type_weight": 0.2,
+        "location_uncertainty": 2.0
+    },
+    "clumping": {
+        "radius": 800,
+        "pixel_threshold": 999999,
+        "fire_area_shapefile": "/work/EMIS/users/bte/sf2py/py/shp/fccs2_acres_pixel_2020_mw.shp",
+        "fire_area_att": "ACRE_PIXEL"
+    },
+    "association": {
+        "num_back_days": 2,
+        "num_forward_days": 0,
+        "pixel_threshold": 999999,
+        "small_fire_distance": 2500,
+        "large_fire_distance": 2500,
+        "size_threshold": 1767150   
+    },
+    "firetype": {
+        "shapefile": "/work/EMIS/users/bte/sf2py/py/shp/FireTypeMap_2020.shp",
+        "att": "WF_SEASON"
+    }
+} 
+

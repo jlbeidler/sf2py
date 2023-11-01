@@ -1,0 +1,8 @@
+{
+    "name": "2020NEI v1 MA",
+    "_comment_": "Dates in YYYYMMDD format",
+    "start_date": "20191231",
+    "end_date": "20210101",
+    "sources": ["HMS 2020 Wildland and Grass v1","MA 2020","USFWS 2020 CONUS"],
+    "export_path": "/work/EMIS/users/bte/WO270.1_2020/sf2py/exports/2020_ma"
+}

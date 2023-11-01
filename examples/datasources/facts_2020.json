@@ -1,0 +1,52 @@
+{
+    "name": "FACTS 2020 v1",
+    "clump_method": "geomac",
+    "assoc_method": "geomac",
+    "probability_method": "default",
+    "fire_type_method": "field",
+    "granularity": 1,
+    "input": {
+        "filename": "/work/EMIS/users/bte/WO270.1_2020/sf2_input/facts_perimeters_2020.shp",
+        "geometry_type": "polygon",
+        "ingest_method": "shp",
+        "new_data_policy": "replace",
+        "fields": {
+            "start_date": "DATE_",
+            "end_date": "",
+            "area": "ACRES",
+            "fire_type": "FIRE_TYPE",
+            "fire_id" : "FACTS_ID",
+            "fire_name": "FIRE_NAME",
+            "lat": "",
+            "lon": ""
+        }
+    },
+    "reconciliation": {
+        "detection_rate": 0.5,
+        "false_alarm_rate": 0.5,
+        "location_weight": 0.85,
+        "size_weight": 0.8,
+        "shape_weight": 0.7,
+        "growth_weight": 0.1,
+        "start_date_uncertainty": 1,
+        "end_date_uncertainty": 1,
+        "name_weight": 0.5,
+        "type_weight": 0.6,
+        "location_uncertainty": 0.2
+    },
+    "clumping": {
+        "radius": 800,
+        "pixel_threshold": 2000,
+        "fire_area_shapefile": "/opt/area.shp",
+        "fire_area_att": "area"
+    },
+    "association": {
+        "num_back_days": 2,
+        "num_forward_days": 1
+    },
+    "firetype": {
+        "shapefile": "",
+        "att": "type"
+    }
+} 
+

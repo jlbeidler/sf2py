@@ -1,0 +1,1 @@
+ogr2ogr test.shp PG:"host=127.0.0.1 user=sf2 dbname=sf2 password='3rd\!qtr@sf2'" -sql "select fire.* from event_fires left join fire on event_fires.fire_id = fire.id where event_fires.event_id = 547361 order by fire.start_date;"

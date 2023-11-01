@@ -1,0 +1,52 @@
+{
+    "name": "ICS209 2020 v1 CONUS",
+    "clump_method": "ics",
+    "assoc_method": "ics",
+    "probability_method": "default",
+    "fire_type_method": "field",
+    "granularity": 1,
+    "input": {
+        "filename": "/work/EMIS/users/bte/WO270.1_2020/sf2_input/ics209_2020_conus.csv",
+        "geometry_type": "point",
+        "ingest_method": "ground",
+        "new_data_policy": "replace",
+        "fields": {
+            "start_date": "start date",
+            "end_date": "report_date",
+            "area": "area",
+            "fire_type": "incident type",
+            "fire_id" : "incident number",
+            "fire_name": "incident name",
+            "lat": "latitude",
+            "lon": "longitude"
+        }
+    },
+    "reconciliation": {
+        "detection_rate": 0.3,
+        "false_alarm_rate": 0.2,
+        "location_weight": 0.5,
+        "size_weight": 0.7,
+        "shape_weight": 0.2,
+        "growth_weight": 0.3,
+        "start_date_uncertainty": 3,
+        "end_date_uncertainty": 5,
+        "name_weight": 0.7,
+        "type_weight": 0.5,
+        "location_uncertainty": 4.0
+    },
+    "clumping": {
+        "radius": 800,
+        "pixel_threshold": 2000,
+        "fire_area_shapefile": "/opt/area.shp",
+        "fire_area_att": "area"
+    },
+    "association": {
+        "num_back_days": 0,
+        "num_forward_days": 0
+    },
+    "firetype": {
+        "shapefile": "",
+        "att": "type"
+    }
+} 
+

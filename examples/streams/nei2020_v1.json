@@ -1,0 +1,8 @@
+{
+    "name": "2020NEI v1",
+    "_comment_": "Dates in YYYYMMDD format",
+    "start_date": "20191231",
+    "end_date": "20210101",
+    "sources": ["DOI 2020 CONUS","FACTS 2020 v1","HMS 2020 Midwest Crops v1","HMS 2020 Tree Crops v1","HMS 2020 Wildland and Grass v1","ICS209 2020 v1 CONUS","NIFS 2020 v1","PFIRS 2020","USFWS 2020 CONUS","Calfire 2020","DE 2020","IA 2020","NV 2020","OR 2020","RI 2020","TPWD 2020","UT 2020","VA 2020","WA 2020","WY 2020","TN 2020","MT 2020","MA 2020"],
+    "export_path": "/work/EMIS/users/bte/WO270.1_2020/sf2py/exports/2020"
+}

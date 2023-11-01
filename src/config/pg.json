@@ -1,0 +1,9 @@
+{
+	"pgserver": "127.0.0.1",
+	"pguser": "sf2",
+	"pgpass": "yourpassword",
+	"dbname": "sf2",
+	"dbport": 5432,
+        "epsg": "5070"
+}
+
