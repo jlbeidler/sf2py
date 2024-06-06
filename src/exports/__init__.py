@@ -11,7 +11,7 @@ class Export():
     def __init__(self, config, db):
         with open(config) as f:
             self._config = json.load(f)
-        atts = ['name','start_date','end_date','export_path']
+        atts = ['name','start_date','end_date','export_path','sources']
         for att in atts:
             try:
                 setattr(self, att, self._config[att])
@@ -19,7 +19,33 @@ class Export():
                 raise ValueError('Missing %s in config file' %att)
         self.stream_id = self._get_stream_id(db)
         self._get_event_data(db)
+        # Add in for retrieving HMS
+        self.sources = tuple([x.lower().strip() for x in self.sources])
+        # Workaround for reconciliation streams with 1 source
+        if len(self.sources) == 1:
+            self.sourcekey = "('%s')" %self.sources[0]
+        else:
+            self.sourcekey = self.sources
+        self.source_ids = self._get_source_ids(db)
  
+    def _get_source_ids(self, db):
+        '''
+        Get the source IDs of the underlying sources for the stream
+        '''
+        q = 'SELECT id, name FROM source WHERE name IN %(sources)s'
+        q = text(q % {'sources': self.sourcekey})
+        with db.engine.connect() as conn:
+            df = pd.read_sql(q, con=conn)
+        if len(df) < len(self.sources):
+            print(df)
+            raise ValueError('Missing sources. Check source names in config')
+        elif len(df) > len(self.sources):
+            raise ValueError('Duplicate source names in source table')
+        if len(df) == 1:
+            return "('%s')" %df['id'].values[0]
+        else:
+            return tuple(df['id'])
+
     def _get_stream_id(self, db):
         '''
         Get the reconciliation stream ID either from the reconciliation stream table 
@@ -44,6 +70,8 @@ class Export():
         q = text(q % {'streamid': self.stream_id, 'startdate': self.start_date, 
           'enddate': self.end_date})
         self.events = pd.read_sql(q, con=db.engine.connect())
+        self.events.start_date = pd.to_datetime(self.events.start_date)
+        self.events.end_date = pd.to_datetime(self.events.end_date)
         self.events['e_txt_id'] = 'SF11E' + self.events['id'].astype(int).astype(str).str.zfill(8)
         self.events.rename(columns={'id': 'event_id', 
           'display_name': 'event_name', 'fire_type': 'type'}, inplace=True)
@@ -74,6 +102,7 @@ class Export():
         q = text(q %{'startdate': self.start_date, 'enddate': self.end_date, 
           'eventids': event_ids})
         df = pd.read_sql(q, con=db.engine.connect())
+        df.date_time = pd.to_datetime(df.date_time)
         df['f_txt_id'] = 'SF11C' + df['id'].astype(int).astype(str).str.zfill(8)
         return df
 
@@ -81,13 +110,20 @@ class Export():
         '''
         Get a geoJSON of the daily event shapes
         '''
+        # A record of 1 needs different SQL syntax
+        if len(events) == 1:
+            events_str = str(events[0])
+            wq = f'WHERE id = {events_str}'
+        else:
+            events_str = ','.join([str(s) for s in events])
+            wq = f'WHERE id IN ({events_str})'
         q = """SELECT jsonb_build_object(\
           'type', 'FeatureCollection','features', jsonb_agg(feature))\
           FROM (SELECT jsonb_build_object('type', 'Feature','id', id, 'geometry',\
           ST_AsGeoJSON(ST_Transform(outline_shape, 4326))::jsonb, 'properties', \
           to_jsonb(row) - 'id' - 'outline_shape') AS feature\
-          FROM (SELECT * FROM event WHERE id IN %(events)s) row) features"""
-        q = text(q %{'events': tuple(events)})
+          FROM (SELECT * FROM event %(where_events)s) row) features"""
+        q = text(q %{'where_events': wq})
         df = pd.read_sql(q, con=db.engine.connect())
         return df.iloc[0]['jsonb_build_object']
 
@@ -160,4 +196,58 @@ class Export():
                 daily_shapes = self._get_daily_event_shape(list(day_events.event_id), db)
                 shp_fn = f'fire_shapes_{day_str}.json'
                 self._write_shapes(daily_shapes, shp_fn)
+
+    def export_hms(self, db):
+        '''
+        Export HMS detect count and mean clump VIIRS FRP per daily fire ID
+        '''
+        # Get the source IDs for the sources in this stream that have an hms clump method
+        q = """SELECT source.id as source_id FROM source WHERE source.id IN %(sourceids)s AND clump_method = 'hms'"""
+        q = text(q %{'sourceids': self.source_ids})
+        df = pd.read_sql(q, con=db.engine.connect())
+        sat_srcs = tuple(df.source_id.drop_duplicates())
+        if len(sat_srcs) == 0:
+            print('No satellite sources in stream. Nothing to do.')
+            df = pd.DataFrame()
+        else:
+            if len(sat_srcs) == 1:
+                q = f'SELECT id as rawdata_id, clump_id FROM raw_data where source_id = {sat_srcs[0]}'
+            else:
+                q = 'SELECT id as rawdata_id, clump_id FROM raw_data where source_id IN %(sourceids)s'
+                q = text(q %{'sourceids': sat_srcs})
+            df = pd.read_sql(q, con=db.engine.connect())
+            detect_cnt = df.groupby('clump_id', as_index=False).count()
+            rawdata_lst = tuple(df.rawdata_id.drop_duplicates())
+            clump_lst = tuple(detect_cnt.clump_id.drop_duplicates())
+            # Updated the raw data ID list only for VIIRS
+            q = """SELECT rawdata_id FROM data_attribute \
+              WHERE name = 'Method' AND attr_value = 'VIIRS' and rawdata_id IN %(rawids)s"""
+            q = text(q %{'rawids': rawdata_lst})
+            df = pd.read_sql(q, con=db.engine.connect())
+            rawdata_lst = tuple(df.rawdata_id.drop_duplicates())
+            # Get the FRP values for VIIRS
+            q = """SELECT attr_value as frp, raw_data.clump_id FROM data_attribute \
+              LEFT JOIN raw_data ON data_attribute.rawdata_id = raw_data.id \
+              WHERE name = 'FRP' AND rawdata_id IN %(rawids)s"""
+            q = text(q %{'rawids': rawdata_lst})
+            frp = pd.read_sql(q, con=db.engine.connect())
+            # Get the mean clump FRP
+            frp.frp = frp.frp.astype(float)
+            frp = frp[frp.frp > 0].groupby('clump_id', as_index=False).mean()
+            # Get the fire IDs for the clumps
+            q = 'SELECT id as clump_id, fire_id from clump WHERE id IN %(clumps)s'
+            q = text(q %{'clumps': clump_lst})
+            cf_xref = pd.read_sql(q, con=db.engine.connect())
+            # Sum up the number of detects per fire
+            detect_cnt = detect_cnt.merge(cf_xref, on='clump_id', how='left')
+            detect_cnt = detect_cnt[['fire_id','rawdata_id']].groupby('fire_id', as_index=False).sum()
+            # Get the mean clump VIIRS FRP for the fire
+            frp = frp.merge(cf_xref, on='clump_id', how='left')
+            frp = frp[['fire_id','frp']].groupby('fire_id', as_index=False).mean()
+            # Every fire ID with FRP should have a detect count but every detect count may not have FRP
+            df = detect_cnt.merge(frp, on='fire_id', how='left')
+            df.rename(columns={'rawdata_id': 'detect_cnt', 'frp': 'mean_frp'}, inplace=True)
+            df['fire_id'] = 'SF11C' + df.fire_id.astype(int).astype(str).str.zfill(8)
+        fn = os.path.join(self.export_path, 'daily_fire_hms.csv')
+        df.to_csv(fn, index=False)
 

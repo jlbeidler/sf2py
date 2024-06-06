@@ -32,6 +32,21 @@ class HmsAssoc(Association):
         idx = self.fires['count'] > self.pixel_threshold
         self.fires.loc[idx, 'area'] = self.fires.loc[idx, 'shape'].area
 
+    def _build_fire_table(self, db, source_id):
+        '''
+        Merge in the fire attributes to build the fire table for output to postgres
+        '''
+        self.fires.reset_index(inplace=True)
+        # Set the fire area using HMS method -- ignore association area definition in config
+        self._set_area(db, source_id)
+        self.fires['source_id'] = source_id
+        # Set the fire types
+        self._set_fire_att('fire_type', db, source_id)
+        # Set the fire names
+        self._set_fire_att('fire_name', db, source_id)
+        # Set the start and end dates
+        self._set_fire_dates(db, source_id)
+
     def assoc(self, db, source_id):
         '''
         Associate the clumps

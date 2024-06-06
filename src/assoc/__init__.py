@@ -12,12 +12,16 @@ class Association():
     def __init__(self, config):
         self._config = config
         self._method = self._config['assoc_method']
-        atts = ['num_back_days','num_forward_days']
-        for att in atts:
+        # Association attribute key: default pairs
+        atts = {'num_back_days': 0, 'num_forward_days': 0, 'area_calc_method': 'geom'}
+        for att, default in atts.items():
             try:
                 setattr(self, att, self._config['association'][att])
             except KeyError as e:
-                raise ValueError('Missing %s in config file' %att)
+                mesg = f'Missing association attribute {att} in configuration file,'+\
+                  'defaulting to {default}'
+                print(mesg, flush=True)
+                setattr(self, att, default)
 
     def _get_next_id(self, db):
         '''
@@ -118,11 +122,19 @@ class Association():
         df = pd.merge(start_dates, end_dates, on='tmp_fire', how='outer')
         self.fires = pd.merge(self.fires, df, on='tmp_fire', how='left')
 
-    def _set_area(self, db, source_id):
+    def _set_area_by_geom(self, db, source_id):
         '''
         Set the fire area as the area of the union of all the associated clumps
         '''
         self.fires['area'] = self.fires['shape'].area
+        self.fires = self.fires[['tmp_fire','shape','area']].copy()
+
+    def _set_area_by_field(self, db, source_id):
+        '''
+        Set the fire area as the sum of all the area fields in the associated clumps
+        '''
+        areas = self.srcmap[['tmp_fire','area']].groupby('tmp_fire', as_index=False).sum()
+        self.fires = self.fires.merge(areas, on='tmp_fire', how='left', suffixes=['_fire',''])
         self.fires = self.fires[['tmp_fire','shape','area']].copy()
 
     def _build_fire_table(self, db, source_id):
@@ -130,8 +142,11 @@ class Association():
         Merge in the fire attributes to build the fire table for output to postgres
         '''
         self.fires.reset_index(inplace=True)
-        # Set the fire area    
-        self._set_area(db, source_id)
+        # Set the fire area
+        if self.area_calc_method == 'geom': 
+            self._set_area_by_geom(db, source_id)
+        else:
+            self._set_area_by_field(db, source_id)
         self.fires['source_id'] = source_id
         # Set the fire types
         self._set_fire_att('fire_type', db, source_id)
