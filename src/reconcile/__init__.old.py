@@ -21,6 +21,11 @@ class Reconciliation():
                 raise ValueError('Missing %s in config file' %att)
         self.stream_id = self._get_stream_id(db)
         self.sources = tuple([x.lower().strip() for x in self.sources])
+        # Workaround for reconciliation streams with 1 source
+        if len(self.sources) == 1:
+            self.sourcekey = "('%s')" %self.sources[0]
+        else:
+            self.sourcekey = self.sources
         self.source_ids = self._get_source_ids(db)
         self.source_atts = self._get_source_atts(db) 
 
@@ -112,15 +117,19 @@ class Reconciliation():
         Get the source IDs of the underlying sources for the stream
         '''
         q = 'SELECT id, name FROM source WHERE name IN %(sources)s'
-        q = text(q % {'sources': self.sources})
+        q = text(q % {'sources': self.sourcekey})
         with db.engine.connect() as conn:
             df = pd.read_sql(q, con=conn)
         if len(df) < len(self.sources):
+            print(df)
             raise ValueError('Missing sources. Check source names in config')
         elif len(df) > len(self.sources):
             raise ValueError('Duplicate source names in source table')
         print('Using sources for reconciliation:\n\t%s' %';'.join(list(df['name'])))
-        return tuple(df['id'])
+        if len(df) == 1:
+            return "('%s')" %df['id'].values[0]
+        else:
+            return tuple(df['id'])
 
     def _get_source_atts(self, db):
         '''
@@ -204,7 +213,7 @@ class Reconciliation():
 
     def _set_event_area(self, db):
         '''
-        Set the event area as the sum of the are of the fires in the highest rated source type
+        Set the event area as the sum of the area of the fires in the highest rated source type
         '''
         df = self._get_event_att(db, 'total_area')
         df = df.groupby('tmp_event', as_index=False).sum()
@@ -274,6 +283,8 @@ class Reconciliation():
         df = gpd.read_postgis(text(q % {'fireids': fire_ids}), con=db.engine.connect(), 
           geom_col='location') 
         df.drop_duplicates(['id','fire_id'], inplace=True)
+        df.start_date = pd.to_datetime(df.start_date)
+        df.end_date = pd.to_datetime(df.end_date)
         # Flatten multi-date clumps so that each day has the same area
         mdclumps = pd.DataFrame(df[(df['start_date'] != df['end_date'])])
         if len(mdclumps) > 0:
@@ -281,8 +292,10 @@ class Reconciliation():
             mdclumps['area'] = mdclumps['area'] / mdclumps['days']
             mdclumps['date'] = mdclumps.apply(lambda row: pd.date_range(row.start_date, 
               row.end_date), axis=1)
-        mdclumps = mdclumps.explode('date', ignore_index=True)
-        mdclumps['date'] = mdclumps['date'].dt.strftime('%Y-%m-%d')
+            mdclumps = mdclumps.explode('date', ignore_index=True)
+            mdclumps['date'] = mdclumps['date'].dt.strftime('%Y-%m-%d')
+        else:
+            mdclumps['date'] = mdclumps['start_date']
         df = df[df['start_date'] == df['end_date']].copy()
         df.rename(columns={'start_date': 'date'}, inplace=True)
         # Concat all of the clumps back together
@@ -298,8 +311,8 @@ class Reconciliation():
         # Cannot aggregate over a geometry data type so set a wkb column, agg and remerge
         df['wkt'] = df['location'].apply(lambda x: x.wkt)
         locs = df[['wkt','location']].drop_duplicates('wkt')
-        df = df[['tmp_event','date','wkt','frac']].groupby(['tmp_event','date','wkt'], 
-          as_index=False).sum()
+        idx = ['tmp_event','date','wkt']
+        df = df[idx+['frac',]].groupby(idx, as_index=False).sum()
         df = pd.merge(df, locs, on='wkt', how='left')
         return df[['tmp_event','date','location','frac']].copy()
 
@@ -313,6 +326,7 @@ class Reconciliation():
         self.events['unique_id'] = uniq_id
         self.events['reconciliationstream_id'] = self.stream_id
         self.events['create_date'] = date.today()
+        self.events['display_name'] = self.events['display_name'].fillna('Unknown Fire')
         self.events = gpd.GeoDataFrame(self.events, geometry='outline_shape')
         # Append the new events
         cols = ['id','create_date','display_name','end_date','outline_shape','probability',
@@ -342,9 +356,13 @@ class Reconciliation():
         df['daily_area'] = df['frac'] * df['total_area']
         seq = pd.Series([self._get_next_id(db, 'event_day_seq') for x in range(len(df))])
         df['id'] = seq
+        # Dummied clump_id for backwards compatability
+        df['clump_id'] = -9
         df = gpd.GeoDataFrame(df, geometry='location')
         # Append all of the newly reconciled events 
-        cols = ['id','daily_area','event_date','event_id','location']
+        cols = ['id','daily_area','event_date','event_id','clump_id','location']
+        if col not in list(df.columns):
+            df[col] = ''
         df[cols].to_postgis(name='event_day', con=db.engine, if_exists='append', index=False)
 
     def purge_events(self, db, keep_events=''):
@@ -373,6 +391,12 @@ class Reconciliation():
                 result = conn.execute(text(ed % {'eventids': event_ids}))
                 result = conn.execute(text(e % {'eventids': event_ids}))
 
+    def _set_fire_dates(self, start_date, end_date):
+        '''
+        Generate a date range set
+        '''
+        return set(pd.date_range(start_date, end_date))
+
     def reconcile(self, db):
         '''
         Reconcile the underlying source fire data into events
@@ -392,7 +416,6 @@ class Reconciliation():
         # Bring in the relevant reconciliation parameters for the sources
         cols = ['source_id','start_date_uncertainty','end_date_uncertainty','location_uncertainty']
         df = pd.merge(df, self.source_atts[cols], on='source_id', how='left')
-        df[['id','source_id','start_date','end_date','area']].to_csv('tmp.csv')
         # Change the uncertainty to a timedelta with a default of 0.
         #  The default should only be applied to existing events.
         df['start_date_uncertainty'] = pd.to_timedelta(df['start_date_uncertainty'].fillna(0), 
@@ -402,50 +425,66 @@ class Reconciliation():
         df['location_uncertainty'] = df['location_uncertainty'].fillna(0)
         # Set the date range without the reconciliation buffer added
         df['date_range'] = df[['start_date','end_date']].apply(lambda row: \
-          set(pd.date_range(row.start_date, row.end_date)), axis=1)
+          self._set_fire_dates(*row), axis=1)
         # Fill in dummy default values for matching and sorting
         df['tmp_event'] = df.index
         df.loc[df['event_id'] > 0, 'tmp_event'] = -9
         df['event_id'] = df['event_id'].fillna(-9)
         df['id'] = df['id'].fillna(-9)
+        # Flag to identify if a fire has already been selected to reconcile, not if it has been
+        # Even if a fire isn't reconciled against another fire it becomes part of an event and
+        #  doesn't need to be newly reconciled, but can still be reconciled against 
+        df['reconciled'] = 0 
         # Set the date range for the loop
-        days = set(list(df['start_date'].drop_duplicates()) + list(df['end_date'].drop_duplicates()))
+        days = list(set(list(df['start_date'].drop_duplicates()) + \
+          list(df['end_date'].drop_duplicates())))
+        days.sort()
         print('Reconciling %s: %s to %s' %(self.name, self.start_date, self.end_date))
         print('\tReconciling %s fires' %len(df))
         bar = Bar('Reconciling', max=len(days))
-        a = pd.DataFrame()
-        # Iterate over the days in the reconcilation date range
+        # Iterate over the days in the reconcilation date range to get a mapping of fire IDs to reconcile into events
         for day in days:
-            today = df[(df['start_date'] <= day) & (df['end_date'] >= day)].copy()
-            today['start_date'] = today['start_date'] - today['start_date_uncertainty']
-            today['end_date'] = today['end_date'] + today['end_date_uncertainty']
-            today['date_range'] = today[['start_date','end_date']].apply(lambda row: \
-              set(pd.date_range(row.start_date, row.end_date)), axis=1)
-            # Get the widest possible date range for this day
-            uncertain_date_range = set(pd.date_range(today.start_date.min(), today.end_date.max()))
+            today = df[(df['start_date'] <= day) & (df['end_date'] >= day) & \
+              (df['reconciled'] == 0)].copy()
             if not today.empty:
+                # Update the "reconciled" flag for the fires going through the process
+                df.loc[(df['start_date'] <= day) & (df['end_date'] >= day) & \
+                  (df['reconciled'] == 0), 'reconciled'] = 1
+                # Set the date ranges with uncertainty for each of the fire records contained
+                today['start_date'] = today[['start_date','start_date_uncertainty']].\
+                  apply(lambda row: row.start_date - row.start_date_uncertainty, axis=1) 
+                today['end_date'] = today[['end_date','end_date_uncertainty']].\
+                  apply(lambda row: row.end_date + row.end_date_uncertainty, axis=1) 
+                today['date_range'] = today[['start_date','end_date']].apply(lambda row: \
+                  self._set_fire_dates(*row), axis=1)
+                # Get the widest possible date range for this day
+                uncertain_date_range = set(pd.date_range(today.start_date.min(), 
+                  today.end_date.max()))
                 # Set an index of the data range for the record to select overlapping activity
                 # Uses an intersection of sets of date ranges
-                df['date_intersect'] = df['date_range'].apply(lambda day: \
-                  day & uncertain_date_range)
+                df['date_intersect'] = df['date_range'].apply(lambda firedays: \
+                  firedays & uncertain_date_range)
                 # Select any records that overlap the date range
-                day_match = df[df['date_intersect'].notnull()].copy()
+                day_match = df.loc[df['date_intersect'] != set(), 
+                  ['shape','id','date_range','tmp_event']].copy()
                 # Convert the uncertainty from km->m and change to a radius
                 today['radius'] = today['location_uncertainty'] * 1000 / 2
-                # Apply the radius buffer
-                today['shape'] = today.apply(lambda row: row['shape'].buffer(row.radius, resolution=8), 
+                # Apply the buffer to the shapes for this day
+                today['shape'] = today.apply(lambda row: row['shape'].buffer(row.radius, resolution=24), 
                   axis=1)
                 # Spatially overlay the daily dataset
-                today = gpd.overlay(today, day_match, how='intersection')
+                #today = gpd.overlay(today, day_match, how='intersection')
+                today = today.sjoin(day_match, how='left', lsuffix='1', rsuffix='2')
                 # Keep spatial intersections that also have date range intersections
+                #today = today[today['tmp_event_1'].notnull()].copy()
+                today.drop('shape', axis=1, inplace=True)
                 today['date_intersect'] = today[['date_range_1','date_range_2']].apply(lambda row: \
                   row.date_range_1 & row.date_range_2, axis=1)
-                today = today[(today['tmp_event_1'].notnull()) & \
-                  (today['date_intersect'].notnull())].copy()
+                today = today[today['date_intersect'] != set()].copy()
                 # Fill in fire IDs where there is a fire on the day with no spatial intersect
                 today.loc[today['id_2'].isnull(), 'id_2'] = \
                   today.loc[today['id_2'].isnull(), 'id_1']
-                # Keep new events and only one record per fire ID
+                # Keep newly reconciled events and only one record per fire ID
                 today.sort_values('tmp_event_1', inplace=True)
                 today.drop_duplicates('id_2', keep='first', inplace=True)
                 today = today[['id_2','tmp_event_1']].copy()
@@ -468,9 +507,9 @@ class Reconciliation():
         # Merge in the fire_ids for the fire source that make up any newly reconciled events
         df = df.loc[(df['tmp_event'] > 0), ['event_id','id','tmp_event']].drop_duplicates()
         if df.empty:
-            print('\tNo new events reconciled for this date range')
+            print('\n\tNo new events reconciled for this date range')
         else:
-            print('\tReconciled into %s new events' %len(df['tmp_event'].drop_duplicates()))
+            print('\n\tReconciled into %s new events' %len(df['tmp_event'].drop_duplicates()))
             # Get a list of event IDs to drop when updating fire_events table
             drop_events = tuple(df.loc[df['event_id'].notnull(), 'event_id'].drop_duplicates())
             if len(drop_events) == 1:
@@ -479,6 +518,7 @@ class Reconciliation():
                 df = pd.merge(df, rec_fires, on='event_id', how='left', suffixes=['','_event'])
                 # Fill in the fire IDs for the merged-in events
                 df.loc[df['id'] < 0, 'id'] = df.loc[df['id'] < 0, 'id_event']
+            # Define the fire to tmp_event matching
             self.srcmap = df[['id','tmp_event']].copy()
             self.srcmap.rename(columns={'id': 'fire_id'}, inplace=True)
             self.events = pd.DataFrame(df['tmp_event'].drop_duplicates(), columns=['tmp_event',])

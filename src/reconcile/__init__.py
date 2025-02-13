@@ -121,6 +121,7 @@ class Reconciliation():
         with db.engine.connect() as conn:
             df = pd.read_sql(q, con=conn)
         if len(df) < len(self.sources):
+            print(df)
             raise ValueError('Missing sources. Check source names in config')
         elif len(df) > len(self.sources):
             raise ValueError('Duplicate source names in source table')
@@ -266,6 +267,7 @@ class Reconciliation():
         At some point in the future it may be useful to carry forward the clump ID or shape so that 
           the polygon can directly into BlueSky. Until that point it can be referenced with the ids.
         '''
+        print('Setting event days', flush=True)
         top_weight = self.srcmap[['tmp_event','growth_weight']].sort_values('growth_weight',
           ascending=False).drop_duplicates('tmp_event', keep='first')
         event_rep = pd.merge(self.srcmap[['tmp_event','fire_id','growth_weight']], top_weight,
@@ -282,6 +284,8 @@ class Reconciliation():
         df = gpd.read_postgis(text(q % {'fireids': fire_ids}), con=db.engine.connect(), 
           geom_col='location') 
         df.drop_duplicates(['id','fire_id'], inplace=True)
+        df.start_date = pd.to_datetime(df.start_date)
+        df.end_date = pd.to_datetime(df.end_date)
         # Flatten multi-date clumps so that each day has the same area
         mdclumps = pd.DataFrame(df[(df['start_date'] != df['end_date'])])
         if len(mdclumps) > 0:
@@ -293,8 +297,10 @@ class Reconciliation():
             mdclumps['date'] = mdclumps['date'].dt.strftime('%Y-%m-%d')
         else:
             mdclumps['date'] = mdclumps['start_date']
+        # Gapfill the clump IDs
+        mdclumps['clump_id'] = ('99999' + mdclumps.index.astype(str)).astype(int)
         df = df[df['start_date'] == df['end_date']].copy()
-        df.rename(columns={'start_date': 'date'}, inplace=True)
+        df.rename(columns={'start_date': 'date', 'id': 'clump_id'}, inplace=True)
         # Concat all of the clumps back together
         df = pd.concat((df, mdclumps))
         df['date'] = pd.to_datetime(df['date'])
@@ -308,15 +314,18 @@ class Reconciliation():
         # Cannot aggregate over a geometry data type so set a wkb column, agg and remerge
         df['wkt'] = df['location'].apply(lambda x: x.wkt)
         locs = df[['wkt','location']].drop_duplicates('wkt')
-        df = df[['tmp_event','date','wkt','frac']].groupby(['tmp_event','date','wkt'], 
-          as_index=False).sum()
+        idx = ['tmp_event','date','wkt','clump_id']
+        df = df[idx+['frac',]].groupby(idx, as_index=False).sum()
         df = pd.merge(df, locs, on='wkt', how='left')
-        return df[['tmp_event','date','location','frac']].copy()
+        print('Records with clump ID: %s' %len(df[['tmp_event','clump_id','date','location','frac']].drop_duplicates(['tmp_event','clump_id','date','location'])))
+        print('Records without clump ID: %s' %len(df[['tmp_event','clump_id','date','location','frac']].drop_duplicates(['tmp_event','date','location'])))
+        return df[['tmp_event','clump_id','date','location','frac']].copy()
 
     def _write_event_data(self, db):
         '''
         Push the raw data to the postgres DB
         '''
+        print('Writing events', flush=True)
         seq = pd.Series([self._get_next_id(db, 'event_seq') for x in range(len(self.events))])
         self.events['id'] = seq
         uniq_id = pd.Series([uuid.uuid1().hex for x in range(len(self.events))])
@@ -345,7 +354,7 @@ class Reconciliation():
     def _write_event_days(self, db, df):
         '''
         Write the daily event date by location
-        Takes the set event days output: df[['tmp_event','date','location','frac']]
+        Takes the set event days output: df[['tmp_event','date','location','frac','clump_id']]
         '''
         events_area = self.events[['tmp_event','id','total_area']].drop_duplicates('tmp_event')
         df = pd.merge(df, events_area, on='tmp_event', how='left')
@@ -354,8 +363,9 @@ class Reconciliation():
         seq = pd.Series([self._get_next_id(db, 'event_day_seq') for x in range(len(df))])
         df['id'] = seq
         df = gpd.GeoDataFrame(df, geometry='location')
+        df['clump_id'] = df['clump_id'].fillna(-9).astype(int)
         # Append all of the newly reconciled events 
-        cols = ['id','daily_area','event_date','event_id','location']
+        cols = ['id','daily_area','event_date','event_id','clump_id','location']
         df[cols].to_postgis(name='event_day', con=db.engine, if_exists='append', index=False)
 
     def purge_events(self, db, keep_events=''):
@@ -363,6 +373,7 @@ class Reconciliation():
         Wipe out all of the existing events in date range for this stream. Optionally specify
           event IDs to keep
         '''
+        print(f'Purging tables of events from stream {self.stream_id}', flush=True)
         # Query the event IDs for the reconciliation stream in this date range
         q = """SELECT id FROM event WHERE reconciliationstream_id = %(streamid)s AND \
           (daterange(start_date, end_date, '[]') && \
@@ -435,7 +446,7 @@ class Reconciliation():
         print('Reconciling %s: %s to %s' %(self.name, self.start_date, self.end_date))
         print('\tReconciling %s fires' %len(df))
         bar = Bar('Reconciling', max=len(days))
-        # Iterate over the days in the reconcilation date range
+        # Iterate over the days in the reconcilation date range to get a mapping of fire IDs to reconcile into events
         for day in days:
             today = df[(df['start_date'] <= day) & (df['end_date'] >= day) & \
               (df['reconciled'] == 0)].copy()
@@ -466,10 +477,11 @@ class Reconciliation():
                 today['shape'] = today.apply(lambda row: row['shape'].buffer(row.radius, resolution=24), 
                   axis=1)
                 # Spatially overlay the daily dataset
-                today = gpd.overlay(today, day_match, how='intersection')
+                #today = gpd.overlay(today, day_match, how='intersection')
+                today = today.sjoin(day_match, how='left', lsuffix='1', rsuffix='2')
                 # Keep spatial intersections that also have date range intersections
-                today = today[today['tmp_event_1'].notnull()].copy()
-                today.drop('geometry', axis=1, inplace=True)
+                #today = today[today['tmp_event_1'].notnull()].copy()
+                today.drop('shape', axis=1, inplace=True)
                 today['date_intersect'] = today[['date_range_1','date_range_2']].apply(lambda row: \
                   row.date_range_1 & row.date_range_2, axis=1)
                 today = today[today['date_intersect'] != set()].copy()
@@ -499,9 +511,9 @@ class Reconciliation():
         # Merge in the fire_ids for the fire source that make up any newly reconciled events
         df = df.loc[(df['tmp_event'] > 0), ['event_id','id','tmp_event']].drop_duplicates()
         if df.empty:
-            print('\tNo new events reconciled for this date range')
+            print('\n\tNo new events reconciled for this date range')
         else:
-            print('\tReconciled into %s new events' %len(df['tmp_event'].drop_duplicates()))
+            print('\n\tReconciled into %s new events' %len(df['tmp_event'].drop_duplicates()))
             # Get a list of event IDs to drop when updating fire_events table
             drop_events = tuple(df.loc[df['event_id'].notnull(), 'event_id'].drop_duplicates())
             if len(drop_events) == 1:
@@ -518,7 +530,7 @@ class Reconciliation():
             self._set_event_fields(db)
             event_days = self._set_event_days(db)
             # Set the event fire dates from a dataframe of tmp_event IDs and associated dates
-            self._set_event_fire_dates(db, event_days[['tmp_event','date']])
+            self._set_event_fire_dates(db, event_days[['tmp_event','date']].drop_duplicates())
             # Remove the existing events that are reconciled into new events
             self.purge_events(db, keep_events)
             # Write the reconciled event table
