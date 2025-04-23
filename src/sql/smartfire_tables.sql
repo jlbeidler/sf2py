@@ -71,6 +71,7 @@ CREATE TABLE event_day (
     daily_area double precision NOT NULL,
     event_date date NOT NULL,
     event_id bigint NOT NULL,
+    clump_id bigint,
     location geometry NOT NULL
 );
 
