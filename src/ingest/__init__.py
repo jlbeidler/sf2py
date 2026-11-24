@@ -70,7 +70,7 @@ class CSVIngest(Ingest):
         Create circular shapes around the lat/lon as a centroid. Base on the area
         '''
         print('Buffering activity points to polygons')
-        self._src = self._src.to_crs(epsg=self.srid)
+        self._src.to_crs(epsg=self.srid, inplace=True)
         self._src['radius'] = ((self._src['area'] * self.ACRES_TO_SQM)/pi) ** 0.5
         self._src['geometry'] = self._src['geometry'].buffer(self._src.radius, resolution=24)
 

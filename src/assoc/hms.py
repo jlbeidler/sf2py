@@ -58,6 +58,7 @@ class HmsAssoc(Association):
         back_days = timedelta(days=self.num_back_days)
         fwd_days = timedelta(days=self.num_forward_days)
         days = set(list(df['start_date'].drop_duplicates()) + list(df['end_date'].drop_duplicates()))
+        # Assign a unique ID for each HMS detect "tmp_fire"
         df['tmp_fire'] = df.index
         self.fires = gpd.GeoDataFrame()
         self.srcmap = pd.DataFrame()
@@ -72,8 +73,7 @@ class HmsAssoc(Association):
             today['shape'] = today.apply(lambda row: row['shape'].buffer(row.radius, resolution=24), axis=1)
             # Intersect today with the buffered days
             # There may be a spatial index speedup here. This is a many to many intersection...needs more research
-            today = gpd.overlay(today, day_match, how='intersection')
-            today = today[today['tmp_fire_1'].notnull()].copy()
+            today = today.sjoin(day_match, how='left', lsuffix='1', rsuffix='2')
             today.loc[today['id_2'].isnull(), 'id_2'] = \
               today.loc[today['id_2'].isnull(), 'id_1']
             today.sort_values('tmp_fire_1', inplace=True)
@@ -83,7 +83,7 @@ class HmsAssoc(Association):
             df = pd.merge(df, today, on='id', how='left', suffixes=['','_today'])
             # Update all clumps with a tmp_fire ID if it is either newly associated or part of the
             #  underlying association
-            tmp_fire_update = df.loc[df['tmp_fire_today'].notnull(), 
+            tmp_fire_update = df.loc[df['tmp_fire_today'].notnull(),
               ['tmp_fire','tmp_fire_today']].drop_duplicates('tmp_fire')
             df.drop('tmp_fire_today', axis=1, inplace=True)
             df = pd.merge(df, tmp_fire_update, on='tmp_fire', how='left')

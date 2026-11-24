@@ -1,3 +1,5 @@
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 from progress.bar import Bar
 from multiprocessing import Pool
 from functools import partial
@@ -54,11 +56,10 @@ class Clump():
 
     def _intersect(self, clump, total):
         '''
-        Perform a union on a clump of the data
+        Perform a join on a clump of the data
         '''
-        ovr = gpd.overlay(clump, total, how='intersection')
-#        ovr = clump.sjoin(total, how='left', op='union', lsuffix='1', rsuffix='2')
-        return pd.DataFrame(ovr.loc[ovr['id_1'].notnull(), ['id_1','id_2']])
+        ovr = clump.sjoin(total, how='left', lsuffix='1', rsuffix='2')
+        return pd.DataFrame(ovr[['id_1','id_2']])
 
     def clump(self, db, source_id):
         '''
@@ -70,14 +71,14 @@ class Clump():
               con=conn, geom_col='shape')
         bar = Bar('Clumping', max=len(df['start_date'].drop_duplicates())) 
         self.srcmap = pd.DataFrame()
+        # Loop through the days to identify which records spatially intersect to get clumps
         for day in list(df['start_date'].drop_duplicates()):
             today = df[df['start_date'] == day].copy()
-            # print('\n', len(today), day, datetime.now()) # debug
-            # Buffer the shapes by the configured radius
-            today['shape'] = today['shape'].buffer(self.radius, resolution=8)
+            # Buffer the shapes by the configured radius -- cap_style=3 makes these a square
+            today['shape'] = today['shape'].buffer(self.radius, resolution=8, cap_style=3)
             ovr_res = []
             clump_intersect = partial(self._intersect, total=today[['shape','id']])
-            # Set the number of processes
+            # Set the number of processes, 4 seems like a good balance
             n_proc = 4
             if len(today) < n_proc:
                 n_proc = len(today)
@@ -85,10 +86,11 @@ class Clump():
                 for res in pool.map(clump_intersect, array_split(today[['shape','id']], n_proc)):
                     ovr_res.append(res)
             pool.close()
-            # print(day, datetime.now()) # debug
             today_ovr = pd.concat(ovr_res).drop_duplicates()
             today['tmp_clump'] = -9
             # Iterate over the fire IDs for the day
+            # Find speedups in this section!
+            #print('\n', len(today), day, datetime.now()) # debug
             for fid in list(today['id']):
                 # Find all intersecting fire IDs
                 intersects = list(today_ovr.loc[today_ovr['id_1'] == fid, 'id_2'].drop_duplicates())
@@ -98,13 +100,16 @@ class Clump():
                 today.loc[idx, 'tmp_clump'] = fid
                 # Then update the tmp_clumps for the intersecting fires
                 today.loc[today['id'].isin(intersects), 'tmp_clump'] = fid
+            #print(day, datetime.now()) # debug
             self.srcmap = pd.concat((self.srcmap, today[['tmp_clump','id','area']]))
             bar.next()
         cols = ['id','start_date','end_date','shape']
+        # Merge in the clump IDs from the daily intersection table
         self.clumps = df[cols].merge(self.srcmap[['id','tmp_clump']], on='id', how='left')
         # Buffer the shapes by the configured radius
         self.clumps['shape'] = self.clumps['shape'].buffer(self.radius, resolution=24)
         self.srcmap.rename(columns={'id': 'rawdata_id'}, inplace=True)
+        # Dissolve the clumps
         self.clumps = gpd.GeoDataFrame(self.clumps, 
           geometry='shape').dissolve(by='tmp_clump')
         self.clumps['source_id'] = source_id
