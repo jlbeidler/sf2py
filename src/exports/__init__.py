@@ -1,7 +1,16 @@
 import os.path
 import json
 from datetime import timedelta, datetime
+from typing import Any, Callable, Optional, cast
+import geopandas as gpd
 import pandas as pd
+from shapely import wkb
+from shapely.affinity import scale as scale_geometry
+from shapely.errors import GEOSException
+from shapely.geometry import Point
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import transform as transform_geometry
+from shapely.ops import unary_union
 from sqlalchemy import text
 
 class Export():
@@ -131,227 +140,382 @@ class Export():
         df = pd.read_sql(q, con=db.engine.connect())
         return df.iloc[0]['jsonb_build_object']
 
-    def _get_daily_fire_extent_shape(self, events, day, db):
-        '''
-        Build area-scaled daily event shapes from event-day clump envelopes
-        '''
+    @staticmethod
+    def _valid_polygon(
+        geometry: Optional[BaseGeometry]
+    ) -> Optional[BaseGeometry]:
+        if geometry is None or geometry.is_empty:
+            return None
+        if not geometry.is_valid:
+            geometry = geometry.buffer(0)
+        if geometry is None or geometry.is_empty:
+            return None
+        if geometry.geom_type == 'GeometryCollection':
+            polygons = [part for part in geometry.geoms
+                        if part.geom_type in ('Polygon', 'MultiPolygon')]
+            if not polygons:
+                return None
+            geometry = unary_union(polygons)
+        if geometry is None or geometry.is_empty:
+            return None
+        if geometry.geom_type not in ('Polygon', 'MultiPolygon'):
+            return None
+        if not geometry.is_valid:
+            geometry = geometry.buffer(0)
+        if geometry is None or geometry.is_empty:
+            return None
+        return geometry if not geometry.is_empty else None
+
+    @staticmethod
+    def _project_geometry(geometry: BaseGeometry, source_crs, target_crs):
+        geo_series = cast(Any, gpd.GeoSeries)
+        return cast(
+            BaseGeometry,
+            geo_series([cast(Any, geometry)], crs=source_crs)
+            .to_crs(target_crs).iloc[0]
+        )
+
+    @classmethod
+    def _overlay(
+        cls,
+        first: BaseGeometry,
+        second: BaseGeometry,
+        operation: Callable[[BaseGeometry, BaseGeometry], BaseGeometry]
+    ) -> Optional[BaseGeometry]:
+        try:
+            return operation(first, second)
+        except GEOSException:
+            first = cls._valid_polygon(first.buffer(0))
+            second = cls._valid_polygon(second.buffer(0))
+            if first is None or second is None:
+                return None
+            try:
+                return operation(first, second)
+            except GEOSException:
+                coordinate_scale = max(
+                    1.0, *(abs(value) for value in first.bounds + second.bounds)
+                )
+                grid_size = coordinate_scale * 1e-9
+
+                def round_coordinates(x, y, z=None):
+                    try:
+                        rounded_x = tuple(
+                            round(value / grid_size) * grid_size for value in x
+                        )
+                        rounded_y = tuple(
+                            round(value / grid_size) * grid_size for value in y
+                        )
+                    except TypeError:
+                        rounded_x = round(x / grid_size) * grid_size
+                        rounded_y = round(y / grid_size) * grid_size
+                    if z is None:
+                        return rounded_x, rounded_y
+                    return rounded_x, rounded_y, z
+
+                first = cls._valid_polygon(
+                    transform_geometry(round_coordinates, first).buffer(0)
+                )
+                second = cls._valid_polygon(
+                    transform_geometry(round_coordinates, second).buffer(0)
+                )
+                if first is None or second is None:
+                    return None
+                return operation(first, second)
+
+    @classmethod
+    def _intersection(
+        cls, first: BaseGeometry, second: BaseGeometry
+    ) -> Optional[BaseGeometry]:
+        return cls._overlay(first, second, lambda left, right: left.intersection(right))
+
+    @classmethod
+    def _difference(
+        cls, first: BaseGeometry, second: BaseGeometry
+    ) -> Optional[BaseGeometry]:
+        return cls._overlay(first, second, lambda left, right: left.difference(right))
+
+    @classmethod
+    def _clean_daily_shape(
+        cls, geometry: Optional[BaseGeometry], available: BaseGeometry
+    ) -> Optional[BaseGeometry]:
+        geometry = cls._valid_polygon(geometry)
+        if geometry is None:
+            return None
+        simplified = cls._valid_polygon(
+            geometry.simplify(cls.DAILY_SHAPE_SIMPLIFY_METERS, preserve_topology=True)
+        )
+        if simplified is None:
+            return None
+        parts = list(simplified.geoms) if simplified.geom_type == 'MultiPolygon' else [simplified]
+        substantial_parts = [
+            part for part in parts if part.area >= cls.MIN_DAILY_PART_AREA_SQM
+        ]
+        if not substantial_parts:
+            substantial_parts = [max(parts, key=lambda part: part.area)]
+        return cls._valid_polygon(unary_union(substantial_parts))
+
+    area_tolerance = 0.01
+    MAX_DAILY_OVERLAP_RATIO = 0.10
+    MAX_EVENT_EXTENSION_RATIO = 0.10
+
+    @classmethod
+    def _daily_shape_within_tolerances(
+        cls,
+        polygon: BaseGeometry,
+        event_polygon: BaseGeometry,
+        target_area: float,
+        previous_burned_area: Optional[BaseGeometry] = None,
+    ) -> bool:
+        outside = cls._difference(polygon, event_polygon)
+        if outside is None:
+            return False
+        allowed_extension = target_area * cls.MAX_EVENT_EXTENSION_RATIO
+        if outside.area > allowed_extension + cls.area_tolerance:
+            return False
+        if previous_burned_area is not None:
+            overlap = cls._intersection(polygon, previous_burned_area)
+            if overlap is None:
+                return False
+            allowed_overlap = target_area * cls.MAX_DAILY_OVERLAP_RATIO
+            if overlap.area > allowed_overlap + cls.area_tolerance:
+                return False
+        return True
+
+    @classmethod
+    def _allocate_daily_shape(
+        cls,
+        activity: BaseGeometry,
+        available: BaseGeometry,
+        target_area: float,
+        previous_burned_area: Optional[BaseGeometry] = None,
+    ) -> Optional[BaseGeometry]:
+        '''Allocate area nearest to the original daily activity geometry.'''
+        active_area = cls._clean_daily_shape(
+            cls._intersection(activity, available), available
+        )
+        if active_area is not None and active_area.area >= target_area - cls.area_tolerance:
+            factor = (target_area / active_area.area) ** 0.5
+            scaled_area = cls._valid_polygon(scale_geometry(
+                active_area, factor, factor, origin=active_area.centroid
+            ))
+            scaled_area = cls._clean_daily_shape(scaled_area, available)
+            if (
+                scaled_area is not None
+                and scaled_area.area >= target_area - cls.area_tolerance
+                and cls._daily_shape_within_tolerances(
+                    scaled_area, available, target_area, previous_burned_area
+                )
+            ):
+                return scaled_area
+
+        def nearby_area(distance):
+            return cls._clean_daily_shape(
+                activity.buffer(distance), available
+            )
+
+        low, high = 0.0, 1.0
+        candidate = nearby_area(high)
+        if candidate is None or candidate.area < target_area - cls.area_tolerance:
+            for _ in range(20):
+                low, high = high, high * 2.0
+                candidate = nearby_area(high)
+                if (
+                    candidate is not None
+                    and candidate.area >= target_area - cls.area_tolerance
+                    and cls._daily_shape_within_tolerances(
+                        candidate, available, target_area, previous_burned_area
+                    )
+                ):
+                    break
+        if (
+            candidate is not None
+            and candidate.area >= target_area - cls.area_tolerance
+            and cls._daily_shape_within_tolerances(
+                candidate, available, target_area, previous_burned_area
+            )
+        ):
+            for _ in range(15):
+                distance = (low + high) / 2.0
+                expanded = nearby_area(distance)
+                if (
+                    expanded is not None
+                    and expanded.area >= target_area - cls.area_tolerance
+                    and cls._daily_shape_within_tolerances(
+                        expanded, available, target_area, previous_burned_area
+                    )
+                ):
+                    high, candidate = distance, expanded
+                    if candidate.area <= target_area + cls.area_tolerance:
+                        break
+                else:
+                    low = distance
+                if high - low <= max(1e-8, high * 1e-12):
+                    break
+            return candidate
+
+        return None
+
+    def _get_daily_fire_extent_shape(
+        self, events, day, db, previous_burned_area_by_event=None,
+        multi_day_event_ids=None
+    ):
+        '''Build daily event polygons from clumps and allocate prior-day overlap.'''
+        if not events:
+            return {'type': 'FeatureCollection', 'features': []}
+
         event_ids = ','.join(str(int(event_id)) for event_id in events)
         event_day = day.strftime('%Y-%m-%d')
-        q = """WITH RECURSIVE daily_areas AS (
+        query = text(f'''WITH daily_areas AS (
           SELECT event_id,
             SUM(ROUND((daily_area / 4046.8564224)::numeric, 2)
               * 4046.8564224) AS daily_area,
             MIN(id) AS event_day_id
           FROM event_day
-          WHERE event_id IN (%(eventids)s) AND event_date = '%(eventday)s'
+          WHERE event_id IN ({event_ids}) AND event_date = '{event_day}'
           GROUP BY event_id
-        ), daily_clump_shapes AS (
-          SELECT event_day.event_id,
-            ST_CollectionExtract(ST_Intersection(
-              clump.shape, event.outline_shape
-            ), 3) AS clump_shape,
-            ST_Transform(event_day.location, ST_SRID(event.outline_shape)) AS location,
-            event.outline_shape
-          FROM event_day
-          JOIN event ON event.id = event_day.event_id
-          LEFT JOIN clump ON clump.id = event_day.clump_id
-          WHERE event_day.event_id IN (%(eventids)s)
-            AND event_day.event_date = '%(eventday)s'
-        ), daily_activity_shapes AS (
-          SELECT event_id,
-            CASE
-              WHEN clump_shape IS NOT NULL AND NOT ST_IsEmpty(clump_shape)
-                THEN clump_shape
-              ELSE ST_Buffer(location, 1.0)
-            END AS shape
-          FROM daily_clump_shapes
-        ), fire_envelopes AS (
-          SELECT event_id,
-            ST_Envelope(ST_Collect(shape)) AS fire_envelope,
-            ST_CollectionExtract(ST_Collect(shape), 3) AS original_shape
-          FROM daily_activity_shapes
-          GROUP BY event_id
-        ), event_targets AS (
-          SELECT event.id AS event_id, event.total_area AS event_area,
-            event.outline_shape, fire_envelopes.fire_envelope,
-            fire_envelopes.original_shape,
-            daily_areas.daily_area,
-            daily_areas.daily_area AS target_area,
-            ST_Centroid(fire_envelopes.fire_envelope) AS anchor
-          FROM event
-          JOIN daily_areas ON daily_areas.event_id = event.id
-          JOIN fire_envelopes ON fire_envelopes.event_id = event.id
-          WHERE daily_areas.daily_area > 0
-        ), scale_search (
-          event_id, event_area, outline_shape, fire_envelope, original_shape,
-          daily_area, target_area, anchor, low_scale, high_scale, iteration,
-          high_area
-        ) AS (
-          SELECT event_id, event_area, outline_shape, fire_envelope,
-            original_shape, daily_area, target_area, anchor,
-            0.0::double precision, 1.0::double precision, 0,
-            ST_Area(ST_CollectionExtract(
-              ST_Intersection(outline_shape, fire_envelope), 3
-            ))
-          FROM event_targets
-          UNION ALL
-          SELECT scale_step.event_id, scale_step.event_area, scale_step.outline_shape,
-            scale_step.fire_envelope, scale_step.original_shape,
-            scale_step.daily_area,
-            scale_step.target_area, scale_step.anchor,
-            CASE
-              WHEN scale_step.high_area < scale_step.target_area THEN scale_step.high_scale
-              WHEN measured.area < scale_step.target_area THEN candidate.scale
-              ELSE scale_step.low_scale
-            END,
-            CASE
-              WHEN scale_step.high_area < scale_step.target_area THEN candidate.scale
-              WHEN measured.area >= scale_step.target_area THEN candidate.scale
-              ELSE scale_step.high_scale
-            END,
-            scale_step.iteration + 1,
-            CASE
-              WHEN scale_step.high_area < scale_step.target_area
-                OR measured.area >= scale_step.target_area THEN measured.area
-              ELSE scale_step.high_area
-            END
-          FROM scale_search AS scale_step
-          CROSS JOIN LATERAL (
-            SELECT CASE
-              WHEN scale_step.high_area < scale_step.target_area
-                THEN scale_step.high_scale * 2.0
-              ELSE (scale_step.low_scale + scale_step.high_scale) / 2.0
-            END AS scale
-          ) AS candidate
-          CROSS JOIN LATERAL (
-            SELECT ST_Translate(
-              ST_Scale(
-                ST_Translate(
-                  scale_step.fire_envelope,
-                  -ST_X(scale_step.anchor),
-                  -ST_Y(scale_step.anchor)
-                ),
-                candidate.scale,
-                candidate.scale
-              ),
-              ST_X(scale_step.anchor),
-              ST_Y(scale_step.anchor)
-            ) AS shape
-          ) AS scaled_envelope
-          CROSS JOIN LATERAL (
-            SELECT ST_Area(ST_CollectionExtract(
-              ST_Intersection(scale_step.outline_shape, scaled_envelope.shape), 3
-            )) AS area
-          ) AS measured
-          WHERE scale_step.iteration < 80
-            AND (
-              scale_step.high_area < scale_step.target_area
-              OR (
-                scale_step.high_scale - scale_step.low_scale > 1e-12
-                AND ABS(scale_step.high_area - scale_step.target_area) > 0.001
-              )
-            )
-        ), final_scale AS (
-          SELECT DISTINCT ON (event_id) *
-          FROM scale_search
-          ORDER BY event_id, iteration DESC
-        ), scaled_shapes AS (
-          SELECT final_scale.*,
-            ST_CollectionExtract(ST_Intersection(
-              final_scale.outline_shape,
-              ST_Translate(
-                ST_Scale(
-                  ST_Translate(
-                    final_scale.fire_envelope,
-                    -ST_X(final_scale.anchor),
-                    -ST_Y(final_scale.anchor)
-                  ),
-                  final_scale.high_scale,
-                  final_scale.high_scale
-                ),
-                ST_X(final_scale.anchor),
-                ST_Y(final_scale.anchor)
-              )
-            ), 3) AS scaled_shape
-          FROM final_scale
-        ), daily_shapes AS (
-          SELECT final_scale.event_id, event.display_name AS event_name,
-            event.start_date AS event_start_date, event.end_date AS event_end_date,
-            event.fire_type AS event_fire_type, daily_areas.event_day_id,
-            final_scale.event_area, '%(eventday)s'::date AS date,
-            final_scale.daily_area AS event_day_area,
-            final_scale.target_area AS daily_area,
-            CASE
-              WHEN ST_GeometryType(final_scale.scaled_shape) = 'ST_Polygon'
-                AND ST_IsValid(final_scale.scaled_shape)
-                AND ST_CoveredBy(final_scale.scaled_shape, final_scale.outline_shape)
-                AND ST_Area(final_scale.scaled_shape) >= final_scale.target_area - 0.001
-                THEN final_scale.scaled_shape
-              ELSE final_scale.original_shape
-            END AS shape
-          FROM scaled_shapes AS final_scale
-          JOIN event ON event.id = final_scale.event_id
-          JOIN daily_areas ON daily_areas.event_id = final_scale.event_id
-        ), valid_shapes AS (
-          SELECT event_id, event_name, event_start_date, event_end_date,
-            event_fire_type, event_day_id, event_area, date, event_day_area,
-            daily_area,
-            ST_CollectionExtract(ST_MakeValid(shape), 3) AS shape
-          FROM daily_shapes
-        ), area_scaled_shapes AS (
-          SELECT valid_shapes.event_id, valid_shapes.event_name,
-            valid_shapes.event_start_date, valid_shapes.event_end_date,
-            valid_shapes.event_fire_type, valid_shapes.event_day_id,
-            valid_shapes.event_area, valid_shapes.date,
-            valid_shapes.event_day_area, valid_shapes.daily_area,
-            CASE
-              WHEN ST_Area(valid_shapes.shape) > 0
-                THEN ST_Translate(
-                  ST_Scale(
-                    ST_Translate(
-                      valid_shapes.shape,
-                      -ST_X(ST_Centroid(valid_shapes.shape)),
-                      -ST_Y(ST_Centroid(valid_shapes.shape))
-                    ),
-                    sqrt(valid_shapes.daily_area / ST_Area(valid_shapes.shape)),
-                    sqrt(valid_shapes.daily_area / ST_Area(valid_shapes.shape))
-                  ),
-                  ST_X(ST_Centroid(valid_shapes.shape)),
-                  ST_Y(ST_Centroid(valid_shapes.shape))
+        )
+        SELECT event.id AS event_id, event.display_name AS event_name,
+          event.start_date AS event_start_date, event.end_date AS event_end_date,
+          event.fire_type AS fire_type, event.total_area AS event_area,
+          event.outline_shape, daily_areas.event_day_id, daily_areas.daily_area,
+          ST_AsBinary(clump.shape) AS clump_wkb,
+          ST_X(event_day.location) AS longitude,
+          ST_Y(event_day.location) AS latitude
+        FROM daily_areas
+        JOIN event ON event.id = daily_areas.event_id
+        JOIN event_day ON event_day.event_id = daily_areas.event_id
+          AND event_day.event_date = '{event_day}'
+        LEFT JOIN clump ON clump.id = event_day.clump_id''')
+        with db.engine.connect() as conn:
+            daily_rows = cast(
+                gpd.GeoDataFrame,
+                gpd.read_postgis(
+                    query, con=conn, geom_col='outline_shape', chunksize=None
                 )
-              ELSE valid_shapes.shape
-            END AS shape
-          FROM valid_shapes
-        )
-        SELECT jsonb_build_object(
-          'type', 'FeatureCollection',
-          'features', COALESCE(jsonb_agg(feature), '[]'::jsonb)
-        )
-        FROM (
-          SELECT jsonb_build_object(
-            'type', 'Feature',
-            'id', event_id,
-            'geometry', ST_AsGeoJSON(ST_Transform(shape, 4326), 15)::jsonb,
-            'properties', jsonb_build_object(
-              'event_id', event_id,
-              'f_txt_id', 'SF11C' || LPAD(event_day_id::text, 8, '0'),
-              'event_name', event_name,
-              'fire_type', event_fire_type,
-              'date', date,
-              'event_start_date', event_start_date,
-              'event_end_date', event_end_date,
-              'daily_area', daily_area / 4046.8564224,
-              'daily_area_sqm', daily_area,
-              'event_day_area_sqm', event_day_area,
-              'event_area', ROUND((event_area / 4046.8564224)::numeric, 2)
             )
-          ) AS feature
-          FROM area_scaled_shapes
-          WHERE NOT ST_IsEmpty(shape) AND ST_IsValid(shape)
-        ) features"""
-        q = text(q % {'eventids': event_ids, 'eventday': event_day})
-        df = pd.read_sql(q, con=db.engine.connect())
-        return df.iloc[0]['jsonb_build_object']
+        if daily_rows.empty:
+            return {'type': 'FeatureCollection', 'features': []}
+
+        features = []
+        for event_id, rows in daily_rows.groupby('event_id', sort=False):
+            event = rows.iloc[0]
+            event_id = int(str(event_id))
+            outline = self._valid_polygon(cast(BaseGeometry, event['outline_shape']))
+            if outline is None:
+                continue
+            crs = cast(Any, daily_rows.crs)
+            outline_geo = None
+
+            track_previous_area = (
+                previous_burned_area_by_event is not None
+                and multi_day_event_ids is not None
+                and event_id in multi_day_event_ids
+            )
+            cumulative_burned_area = None
+            burned_area = None
+            if track_previous_area:
+                previous = previous_burned_area_by_event.get(event_id)
+                if previous is not None:
+                    previous_crs, cumulative_burned_area = previous
+                    if previous_crs != crs:
+                        cumulative_burned_area = self._project_geometry(
+                            cumulative_burned_area, previous_crs, crs
+                        )
+                    cumulative_burned_area = self._valid_polygon(
+                        cumulative_burned_area
+                    )
+                    if cumulative_burned_area is not None:
+                        burned_area = self._valid_polygon(
+                            self._intersection(cumulative_burned_area, outline)
+                        )
+            available = outline
+            activity_shapes = []
+            for row in rows.itertuples():
+                activity = None
+                if isinstance(row.clump_wkb, (bytes, bytearray, memoryview)):
+                    clump = self._valid_polygon(
+                        wkb.loads(bytes(row.clump_wkb))
+                    )
+                    if clump is not None:
+                        activity = self._valid_polygon(
+                            self._intersection(clump, outline)
+                        )
+                if activity is None:
+                    point = Point(float(str(row.longitude)), float(str(row.latitude)))
+                    if outline_geo is None:
+                        outline_geo = self._valid_polygon(
+                            self._project_geometry(outline, crs, 4326)
+                        )
+                    if outline_geo is None:
+                        continue
+                    if outline_geo.covers(point):
+                        point = self._project_geometry(point, 4326, crs)
+                    else:
+                        point = outline.representative_point()
+                    activity = self._valid_polygon(
+                        self._intersection(point.buffer(1.0), outline)
+                    )
+                if activity is not None:
+                    activity_shapes.append(activity)
+            if not activity_shapes:
+                continue
+
+            activity = self._valid_polygon(unary_union(activity_shapes))
+            if activity is None:
+                continue
+            target_area = float(str(event['daily_area']))
+            if target_area <= 0:
+                continue
+            polygon = self._allocate_daily_shape(
+                activity, available, target_area, burned_area
+            )
+            if polygon is None or polygon.is_empty:
+                continue
+            if track_previous_area:
+                cumulative_burned_area = (
+                    polygon if cumulative_burned_area is None else self._overlay(
+                        cumulative_burned_area,
+                        polygon,
+                        lambda left, right: left.union(right)
+                    )
+                )
+                cumulative_burned_area = self._valid_polygon(
+                    cumulative_burned_area
+                )
+                if cumulative_burned_area is not None:
+                    previous_burned_area_by_event[event_id] = (
+                        crs, cumulative_burned_area
+                    )
+            geojson_geometry = self._project_geometry(
+                polygon, crs, 4326
+            ).__geo_interface__
+            acres = target_area / self.ACRES_TO_SQM
+            features.append({
+                'type': 'Feature',
+                'id': int(str(event_id)),
+                'geometry': geojson_geometry,
+                'properties': {
+                    'event_id': int(str(event_id)),
+                    'f_txt_id': f"SF11C{int(str(event['event_day_id'])):08d}",
+                    'event_name': event['event_name'],
+                    'fire_type': event['fire_type'],
+                    'date': event_day,
+                    'event_start_date': pd.Timestamp(
+                        event['event_start_date']
+                    ).strftime('%Y-%m-%d'),
+                    'event_end_date': pd.Timestamp(
+                        event['event_end_date']
+                    ).strftime('%Y-%m-%d'),
+                    'daily_area': round(acres, 2),
+                    'daily_area_sqm': target_area,
+                    'event_day_area_sqm': target_area,
+                    'event_area': round(
+                        float(str(event['event_area'])) / self.ACRES_TO_SQM, 2
+                    )
+                }
+            })
+
+        return {'type': 'FeatureCollection', 'features': features}
 
     def _get_sources(self, db):
         '''
@@ -370,6 +534,8 @@ class Export():
         return event_fires.reset_index()
 
     ACRES_TO_SQM = 4046.8564224
+    DAILY_SHAPE_SIMPLIFY_METERS = 1.0
+    MIN_DAILY_PART_AREA_SQM = 400.0
     def _write_events(self, df, fn):
         '''
         Write the BSF-style events file
@@ -449,15 +615,21 @@ class Export():
         Export event polygons scaled to daily area and aligned with daily activity
         '''
         event_days = self._get_event_days(db)
+        multi_day_event_ids = set(
+            event_days.groupby('event_id')['date_time'].nunique()
+            .loc[lambda counts: counts > 1].index
+        )
+        previous_burned_area_by_event = {}
         for day in list(pd.date_range(self.start_date, self.end_date)):
             day_str = datetime.strftime(day, '%Y%m%d')
-            print('Exporting fire extents %s' %day_str)
             day_event_ids = event_days.loc[
               event_days['date_time'] == day, 'event_id'
             ].drop_duplicates()
+            print(f'Exporting {len(day_event_ids)} fire extents for {day_str}')
             if not day_event_ids.empty:
                 daily_shapes = self._get_daily_fire_extent_shape(
-                  list(day_event_ids), day, db)
+                  list(day_event_ids), day, db, previous_burned_area_by_event,
+                  multi_day_event_ids)
                 shp_fn = f'fire_daily_{day_str}.json'
                 self._write_shapes(daily_shapes, shp_fn)
 
