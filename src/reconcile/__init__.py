@@ -4,7 +4,6 @@ import json
 from datetime import timedelta, date
 import pandas as pd
 import geopandas as gpd
-from sqlalchemy import text
 
 class Reconciliation():
     '''
@@ -33,9 +32,7 @@ class Reconciliation():
         '''
         Get the next event sequence ID from the DB sequence
         '''
-        with db.engine.connect() as conn:
-            result = conn.execute(text("SELECT nextval('%s')" %seq))
-        return result.first()[0]
+        return db.next_id(seq)
 
     def _get_stream_id(self, db):
         '''
@@ -43,21 +40,25 @@ class Reconciliation():
           stream already exists or from the sequence
         '''
         name_slug = self.name.strip().lower().replace(' ','-')
-        with db.engine.connect() as conn:
-            q = text("SELECT id FROM reconciliation_stream WHERE name_slug= '%s'" %name_slug)
-            df = pd.read_sql(q, con=conn)
-            # If the stream does not exist in the table get a fresh stream id number and add it to
-            #   the stream table
-            if len(df) == 0:
-                stream_id = self._get_next_id(db, 'reconciliation_stream_seq')
-                row = pd.DataFrame([[stream_id, self.name, '', name_slug, 'f'],], 
-                  columns=['id','name','reconciliation_method','name_slug','auto_reconcile']) 
-                row.to_sql(name='reconciliation_stream', con=db.engine, if_exists='append', index=False)
-            # If it is there then grab the stream ID
-            elif len(df) == 1:
-                stream_id = int(df['id'].values[0])
-            else:
-                raise ValueError('Somehow there are multiple streams with the same name')
+        slug = name_slug.replace("'", "''")
+        df = db.read_sql(
+            "SELECT id FROM reconciliation_stream WHERE name_slug = '%s'" % slug
+        )
+        # If the stream does not exist in the table get a fresh stream id number and add it.
+        if len(df) == 0:
+            stream_id = self._get_next_id(db, 'reconciliation_stream_seq')
+            row = pd.DataFrame([{
+                "id": stream_id,
+                "name": self.name,
+                "reconciliation_method": "",
+                "name_slug": name_slug,
+                "auto_reconcile": False,
+            }])
+            db.write_dataframe("reconciliation_stream", row)
+        elif len(df) == 1:
+            stream_id = int(df['id'].values[0])
+        else:
+            raise ValueError('Somehow there are multiple streams with the same name')
         return stream_id
 
     def _get_event_ids(self, db):
@@ -66,11 +67,10 @@ class Reconciliation():
           in the table for this stream for the given date range
         '''
         q = """SELECT id FROM event WHERE reconciliationstream_id = %(streamid)s AND \
-          (daterange(start_date, end_date, '[]') && \
-          daterange('%(startdate)s', '%(enddate)s', '[]'))"""
-        q = text(q % {'streamid': self.stream_id, 'startdate': self.start_date, 
-          'enddate': self.end_date})
-        df = pd.read_sql(q, con=db.engine.connect()) 
+          start_date <= '%(enddate)s' AND end_date >= '%(startdate)s'"""
+        q = q % {'streamid': self.stream_id, 'startdate': self.start_date,
+          'enddate': self.end_date}
+        df = db.read_sql(q)
         return tuple(df['id']) 
 
     def _get_reconciled_fire_ids(self, db, event_ids):
@@ -80,7 +80,7 @@ class Reconciliation():
         '''
         if len(event_ids) > 0:
             q = 'SELECT event_id, fire_id FROM event_fires WHERE event_id IN %(eventids)s'
-            df = pd.read_sql(text(q % {'eventids': event_ids}), con=db.engine.connect())
+            df = db.read_sql(q % {'eventids': event_ids})
             df.rename(columns={'fire_id': 'id'}, inplace=True)
             return df 
         else:
@@ -93,13 +93,12 @@ class Reconciliation():
         '''
         q = """SELECT id, source_id, area, shape, start_date, end_date FROM fire \
           WHERE source_id IN %(sourceids)s AND \
-          (daterange(start_date, end_date, '[]') && \
-          daterange('%(startdate)s', '%(enddate)s', '[]'))"""
+          start_date <= '%(enddate)s' AND end_date >= '%(startdate)s'"""
         if fire_ids: 
             q += ' AND id NOT IN %(fireids)s'
-        fire_query = text(q % {'sourceids': self.source_ids, 'startdate': self.start_date, 
-          'enddate': self.end_date, 'fireids': fire_ids})
-        df = gpd.read_postgis(fire_query, con=db.engine.connect(), geom_col='shape')
+        fire_query = q % {'sourceids': self.source_ids, 'startdate': self.start_date,
+          'enddate': self.end_date, 'fireids': fire_ids}
+        df = db.read_geodataframe(fire_query, geom_col='shape')
         return df
 
     def _get_reconciled_events(self, db, event_ids):
@@ -107,8 +106,7 @@ class Reconciliation():
         Load all of the existing events with the given event IDs
         '''
         q = 'SELECT id, start_date, end_date, outline_shape FROM event WHERE id IN %(eventids)s' 
-        df = gpd.read_postgis(text(q % {'eventids': event_ids}), con=db.engine.connect(), 
-          geom_col='outline_shape')
+        df = db.read_geodataframe(q % {'eventids': event_ids}, geom_col='outline_shape')
         df.rename(columns={'id': 'event_id', 'outline_shape': 'shape'}, inplace=True)
         return df
 
@@ -117,9 +115,8 @@ class Reconciliation():
         Get the source IDs of the underlying sources for the stream
         '''
         q = 'SELECT id, name FROM source WHERE name IN %(sources)s'
-        q = text(q % {'sources': self.sourcekey})
-        with db.engine.connect() as conn:
-            df = pd.read_sql(q, con=conn)
+        q = q % {'sources': self.sourcekey}
+        df = db.read_sql(q)
         if len(df) < len(self.sources):
             print(df)
             raise ValueError('Missing sources. Check source names in config')
@@ -139,8 +136,8 @@ class Reconciliation():
         Location uncertainty is in km. Start and end date uncertainty is in days backwards or forwards. 
         '''
         q = 'SELECT * FROM default_weighting WHERE id IN %(sourceids)s'
-        q = text(q % {'sourceids': self.source_ids})
-        df = pd.read_sql(q, con=db.engine.connect())
+        q = q % {'sourceids': self.source_ids}
+        df = db.read_sql(q)
         df.rename(columns={'id': 'source_id'}, inplace=True)
         return df
 
@@ -149,8 +146,8 @@ class Reconciliation():
         Get the fire source ids from the fire ids
         '''
         q = 'SELECT id, source_id FROM fire WHERE id IN %(fireids)s'
-        q = text(q % {'fireids': fire_ids})
-        df = pd.read_sql(q, con=db.engine.connect())
+        q = q % {'fireids': fire_ids}
+        df = db.read_sql(q)
         df.rename(columns={'id': 'fire_id'}, inplace=True)
         return df
 
@@ -172,11 +169,11 @@ class Reconciliation():
         event_rep = event_rep.loc[idx, ['tmp_event','fire_id']].copy()
         fire_ids = tuple(event_rep['fire_id'].drop_duplicates())
         q = 'SELECT id, %(incol)s FROM fire WHERE id IN %(fireids)s'
-        q = text(q % {'incol': incol, 'fireids': fire_ids})
+        q = q % {'incol': incol, 'fireids': fire_ids}
         if incol == 'shape':
-            df = gpd.read_postgis(q, con=db.engine.connect(), geom_col=incol) 
+            df = db.read_geodataframe(q, geom_col=incol)
         else:
-            df = pd.read_sql(q, con=db.engine.connect())
+            df = db.read_sql(q)
         df.rename(columns={'id': 'fire_id', incol: outcol}, inplace=True)
         df = event_rep.merge(df, on='fire_id')
         return df[['tmp_event',outcol]].copy()
@@ -201,7 +198,7 @@ class Reconciliation():
         '''
         fire_ids = tuple(self.srcmap['fire_id'])
         q = 'SELECT id, start_date, end_date FROM fire WHERE id IN %(fireids)s'
-        df = pd.read_sql(text(q % {'fireids': fire_ids}), con=db.engine.connect())
+        df = db.read_sql(q % {'fireids': fire_ids})
         df.rename(columns={'id': 'fire_id'}, inplace=True)
         df = pd.merge(self.srcmap[['fire_id','tmp_event']], df, on='fire_id', how='left')
         start_dates = df[['tmp_event','start_date']].sort_values('start_date', 
@@ -234,7 +231,7 @@ class Reconciliation():
         '''
         fire_ids = tuple(self.srcmap['fire_id'].drop_duplicates())
         q = 'SELECT id, probability FROM fire WHERE id IN %(fireids)s'
-        df = pd.read_sql(text(q % {'fireids': fire_ids}), con=db.engine.connect())
+        df = db.read_sql(q % {'fireids': fire_ids})
         df.rename(columns={'id': 'fire_id'}, inplace=True)
         df['probability'] = 1 - df['probability']
         df = df.merge(self.srcmap, on='fire_id')
@@ -278,11 +275,14 @@ class Reconciliation():
         fire_ids = tuple(event_rep['fire_id'].drop_duplicates())
         # Retrieve the clumps for the fire source with the highest growth weight in that event
         # Get the location of the clump as the centroid.
-        q = '''SELECT id, fire_id, start_date, end_date, area, \
-          ST_CENTROID(ST_TRANSFORM(shape,4326)) as location FROM clump \
+        q = '''SELECT id, fire_id, start_date, end_date, area, shape FROM clump \
           WHERE fire_id IN %(fireids)s'''
-        df = gpd.read_postgis(text(q % {'fireids': fire_ids}), con=db.engine.connect(), 
-          geom_col='location') 
+        df = db.read_geodataframe(q % {'fireids': fire_ids}, geom_col="shape")
+        df = df.to_crs(epsg=4326)
+        df["location"] = df.geometry.map(lambda geometry: geometry.centroid)
+        df = gpd.GeoDataFrame(
+            df.drop(columns="shape"), geometry="location", crs="EPSG:4326"
+        )
         df.drop_duplicates(['id','fire_id'], inplace=True)
         df.start_date = pd.to_datetime(df.start_date)
         df.end_date = pd.to_datetime(df.end_date)
@@ -337,7 +337,7 @@ class Reconciliation():
         # Append the new events
         cols = ['id','create_date','display_name','end_date','outline_shape','probability',
           'start_date','total_area','unique_id','reconciliationstream_id','fire_type']
-        self.events[cols].to_postgis(name='event', con=db.engine, if_exists='append', index=False)
+        db.write_dataframe("event", self.events[cols], geometry_columns=("outline_shape",))
 
     def _write_event_fires(self, db):
         '''
@@ -349,7 +349,7 @@ class Reconciliation():
         df = pd.merge(self.events[['id','tmp_event']], self.srcmap[['tmp_event','fire_id']], 
           on='tmp_event', how='left')
         df.rename(columns={'id': 'event_id'}, inplace=True)
-        df[cols].to_sql(name='event_fires', con=db.engine, if_exists='append', index=False)
+        db.write_dataframe("event_fires", df[cols])
 
     def _write_event_days(self, db, df):
         '''
@@ -362,11 +362,11 @@ class Reconciliation():
         df['daily_area'] = df['frac'] * df['total_area']
         seq = pd.Series([self._get_next_id(db, 'event_day_seq') for x in range(len(df))])
         df['id'] = seq
-        df = gpd.GeoDataFrame(df, geometry='location')
+        df = gpd.GeoDataFrame(df, geometry='location', crs='EPSG:4326')
         df['clump_id'] = df['clump_id'].fillna(-9).astype(int)
         # Append all of the newly reconciled events 
         cols = ['id','daily_area','event_date','event_id','clump_id','location']
-        df[cols].to_postgis(name='event_day', con=db.engine, if_exists='append', index=False)
+        db.write_dataframe("event_day", df[cols], geometry_columns=("location",))
 
     def purge_events(self, db, keep_events=''):
         '''
@@ -376,24 +376,22 @@ class Reconciliation():
         print(f'Purging tables of events from stream {self.stream_id}', flush=True)
         # Query the event IDs for the reconciliation stream in this date range
         q = """SELECT id FROM event WHERE reconciliationstream_id = %(streamid)s AND \
-          (daterange(start_date, end_date, '[]') && \
-          daterange('%(startdate)s', '%(enddate)s', '[]'))"""
+          start_date <= '%(enddate)s' AND end_date >= '%(startdate)s'"""
         # optionally ignore event IDs in the list
         if keep_events:
             q += ' AND id NOT IN %(eventids)s'
-        q = text(q % {'streamid': self.stream_id, 'startdate': self.start_date, 
-          'enddate': self.end_date, 'eventids': keep_events})
-        df = pd.read_sql(q, con=db.engine)
+        q = q % {'streamid': self.stream_id, 'startdate': self.start_date,
+          'enddate': self.end_date, 'eventids': keep_events}
+        df = db.read_sql(q)
         event_ids = tuple(df['id'].drop_duplicates())
         if event_ids:
             # Drop the queried event IDs from the 3 event tables
             ef = 'DELETE FROM event_fires WHERE event_id IN %(eventids)s'
             ed = 'DELETE FROM event_day WHERE event_id IN %(eventids)s'
             e = 'DELETE FROM event WHERE id IN %(eventids)s'
-            with db.engine.connect() as conn:
-                result = conn.execute(text(ef % {'eventids': event_ids}))
-                result = conn.execute(text(ed % {'eventids': event_ids}))
-                result = conn.execute(text(e % {'eventids': event_ids}))
+            db.execute(ef % {'eventids': event_ids})
+            db.execute(ed % {'eventids': event_ids})
+            db.execute(e % {'eventids': event_ids})
 
     def _set_fire_dates(self, start_date, end_date):
         '''
@@ -431,7 +429,7 @@ class Reconciliation():
         df['date_range'] = df[['start_date','end_date']].apply(lambda row: \
           self._set_fire_dates(*row), axis=1)
         # Fill in dummy default values for matching and sorting
-        df['tmp_event'] = df.index
+        df['tmp_event'] = df.index + 1
         df.loc[df['event_id'] > 0, 'tmp_event'] = -9
         df['event_id'] = df['event_id'].fillna(-9)
         df['id'] = df['id'].fillna(-9)

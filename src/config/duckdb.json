@@ -1,0 +1,5 @@
+{
+  "backend": "duckdb",
+  "database": "../../data/sf2.duckdb",
+  "epsg": "5070"
+}

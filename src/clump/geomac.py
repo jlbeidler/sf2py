@@ -2,7 +2,6 @@ from progress.bar import Bar
 from datetime import datetime, timedelta
 import pandas as pd
 import geopandas as gpd
-from sqlalchemy import text
 from . import Clump
 
 class GeomacClump(Clump):
@@ -22,9 +21,10 @@ class GeomacClump(Clump):
         Clump the raw data for Geomac/Shapefile
         '''
         bar = Bar('Clumping', max=2) 
-        with db.engine.connect() as conn:
-            self.clumps = gpd.read_postgis(text("SELECT * from raw_data WHERE source_id = '%s'" %source_id),
-              con=conn, geom_col='shape')
+        self.clumps = db.read_geodataframe(
+            "SELECT * from raw_data WHERE source_id = '%s'" % source_id,
+            geom_col="shape",
+        )
         bar.next()
         self.clumps.rename(columns={'id': 'rawdata_id'}, inplace=True)
         self._write_clump_data(db)

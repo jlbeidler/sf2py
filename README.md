@@ -1,6 +1,6 @@
 # Fire Integrated Reconciliation Engine
 
-This repository implements the SmartFire 2 fire activity reconciliation methodology as a Python/PostGIS command-line package. It replaces the earlier client/server and Java Tomcat workflow with command-line ingestion, clumping, association, reconciliation, and CSV export.
+This repository implements the SmartFire 2 fire activity reconciliation methodology as a Python command-line package. It supports PostgreSQL/PostGIS and an embedded DuckDB backend, with Ibis providing the DuckDB connection and dataframe writes. It replaces the earlier client/server and Java Tomcat workflow with command-line ingestion, clumping, association, reconciliation, and CSV export.
 
 The repository is derived from the original GPLv3 SmartFire 2 implementation. See:
 
@@ -12,7 +12,7 @@ The repository is derived from the original GPLv3 SmartFire 2 implementation. Se
 A SmartFire run has two phases:
 
 1. **Import every activity source.** Each source is ingested, converted to point or polygon geometry, clumped into temporary source clumps, and associated into source-level fires.
-2. **Reconcile selected sources into a stream.** Fire records are matched in space and time with source-specific uncertainty and weighting values. Reconciled events, daily locations, and daily CSV exports are written to PostGIS and the configured export directory.
+2. **Reconcile selected sources into a stream.** Fire records are matched in space and time with source-specific uncertainty and weighting values. Reconciled events, daily locations, and daily CSV exports are written to the configured database and export directory.
 
 ```text
 source data
@@ -30,7 +30,7 @@ source data
 | `src/load_source.py` | Loads one source configuration and processes a source through ingest, clump, and association |
 | `src/reconcile_fires.py` | Purges overlapping stream events, reconciles the configured sources, and exports the result |
 | `src/purge_stream.py` | Purges events for a reconciliation stream/date range without reconciling or exporting |
-| `src/database.py` | Loads PostgreSQL settings and creates the SQLAlchemy engine |
+| `src/database.py` | Loads PostgreSQL/PostGIS or Ibis DuckDB settings and provides database operations |
 | `src/sources.py` | Writes source definitions and default reconciliation weights |
 | `src/ingest/` | CSV, ground-report, satellite, and shapefile ingestion implementations |
 | `src/clump/` | HMS, ICS, and perimeter/shapefile clumping implementations |
@@ -39,6 +39,8 @@ source data
 | `src/exports/` | Daily BSF-style event/location export and satellite detection summaries |
 | `src/sql/` | PostGIS table, sequence, constraint, and SRID setup |
 | `src/config/pg.json` | PostgreSQL connection settings |
+| `src/config/duckdb.json` | Example local DuckDB database settings |
+| `src/sql/duckdb_tables.sql` | DuckDB schema using WKB blobs for geometry |
 | `examples/datasources/` | Example source configurations for HMS, NIFS, ICS-209, and other datasets |
 | `examples/streams/` | Example reconciliation stream configurations |
 | `examples/inputs/` | Small example input files |
@@ -51,12 +53,19 @@ source data
 The implementation requires:
 
 - Linux/Unix shell and Python 3
-- PostgreSQL with PostGIS
-- Python packages: `SQLAlchemy`, `pandas`, `GeoPandas`, `GeoAlchemy2`, `numpy`, `progress`
+- Shared Python packages: `SQLAlchemy`, `pandas`, `GeoPandas`, `numpy`, `progress`
+- PostgreSQL backend: PostgreSQL with PostGIS and `GeoAlchemy2`
+- DuckDB backend: DuckDB with Ibis (install `requirements-duckdb.txt`)
 - GIS support suitable for reading and writing the source formats (including Esri shapefiles)
-- `psql` for database setup
+- `psql` for PostgreSQL database setup
 
-No dependency manifest is included in this repository. Install the Python packages and system PostgreSQL/PostGIS dependencies in your runtime environment before running the scripts.
+The DuckDB backend additionally requires Ibis with its DuckDB backend:
+
+```bash
+pip install -r requirements-duckdb.txt
+```
+
+The DuckDB requirements file installs the optional Ibis/DuckDB dependencies only. Install the shared Python packages and the dependencies for the selected database and input formats in your runtime environment.
 
 ## Database setup
 
@@ -92,7 +101,17 @@ cd src/sql
 psql -U sf2 -h 127.0.0.1 sf2 -f smartfire_tables.sql
 ```
 
-The SQL defaults to EPSG 5070 for source, clump, fire, and event shapes and EPSG 4326 for event-day locations. Change the SRID definitions consistently in [`smartfire_tables.sql`](src/sql/smartfire_tables.sql) and `pg.json` if the study area requires a different projected CRS.
+### DuckDB setup
+
+The DuckDB configuration in [`src/config/duckdb.json`](src/config/duckdb.json) points to a local database file. From `src`, initialize the required tables and sequences with:
+
+```bash
+python3 setup_duckdb.py config/duckdb.json
+```
+
+Geometry is stored as WKB in DuckDB; clumping, association, and reconciliation continue to use GeoPandas/Shapely for spatial processing. No PostGIS extension is required for DuckDB.
+
+The PostgreSQL SQL defaults to EPSG 5070 for source, clump, fire, and event shapes and EPSG 4326 for event-day locations. Change the SRID definitions consistently in [`smartfire_tables.sql`](src/sql/smartfire_tables.sql) and `pg.json` if the study area requires a different projected CRS.
 
 ## Prepare activity data
 
@@ -185,6 +204,12 @@ cd src
 python3 load_source.py ../examples/datasources/nifs_2020.json
 ```
 
+The optional second argument selects a database configuration. Existing commands default to PostgreSQL; pass `config/duckdb.json` to use DuckDB:
+
+```bash
+python3 load_source.py ../examples/datasources/nifs_2020.json config/duckdb.json
+```
+
 The loader:
 
 1. Creates or replaces the source and default weighting rows.
@@ -228,6 +253,8 @@ Regional examples are under [`examples/streams/`](examples/streams/).
 cd src
 python3 reconcile_fires.py ../examples/streams/nei2020_v1.json
 ```
+
+Pass `config/duckdb.json` as the second argument to reconcile against DuckDB. The same optional argument is supported by `purge_stream.py` and `export_fires.py`.
 
 The reconciliation phase:
 

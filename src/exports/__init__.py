@@ -1,17 +1,15 @@
 import os.path
 import json
-from datetime import timedelta, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Callable, Optional, cast
 import geopandas as gpd
 import pandas as pd
-from shapely import wkb
 from shapely.affinity import scale as scale_geometry
 from shapely.errors import GEOSException
 from shapely.geometry import Point
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform as transform_geometry
 from shapely.ops import unary_union
-from sqlalchemy import text
 
 class Export():
     '''
@@ -47,9 +45,8 @@ class Export():
         else:
             self.sourcekey = self.sources
         q = 'SELECT id, name FROM source WHERE name IN %(sources)s'
-        q = text(q % {'sources': self.sourcekey})
-        with db.engine.connect() as conn:
-            df = pd.read_sql(q, con=conn)
+        q = q % {'sources': self.sourcekey}
+        df = db.read_sql(q)
         if len(df) < len(self.sources):
             print(df)
             raise ValueError('Missing sources. Check source names in config')
@@ -65,13 +62,13 @@ class Export():
         Get the reconciliation stream ID either from the reconciliation stream table 
         '''
         name_slug = self.name.strip().lower().replace(' ','-')
-        with db.engine.connect() as conn:
-            q = text("SELECT id FROM reconciliation_stream WHERE name_slug= '%s'" %name_slug)
-            df = pd.read_sql(q, con=conn)
-            if len(df) == 1:
-                stream_id = int(str(df['id'].values[0]))
-            else:
-                raise ValueError('Somehow there are multiple streams with the same name')
+        name_slug = name_slug.replace("'", "''")
+        q = "SELECT id FROM reconciliation_stream WHERE name_slug = '%s'" % name_slug
+        df = db.read_sql(q)
+        if len(df) == 1:
+            stream_id = int(str(df['id'].values[0]))
+        else:
+            raise ValueError('Somehow there are multiple streams with the same name')
         return stream_id
 
     def _get_event_data(self, db):
@@ -81,9 +78,9 @@ class Export():
         q = """SELECT id, display_name, start_date, end_date, total_area, fire_type FROM \
           event WHERE reconciliationstream_id = %(streamid)s AND \
           start_date <= '%(enddate)s' AND end_date >= '%(startdate)s'"""
-        q = text(q % {'streamid': self.stream_id, 'startdate': self.start_date, 
-          'enddate': self.end_date})
-        self.events = pd.read_sql(q, con=db.engine.connect())
+        q = q % {'streamid': self.stream_id, 'startdate': self.start_date,
+          'enddate': self.end_date}
+        self.events = db.read_sql(q)
         self.events['start_date'] = pd.to_datetime(self.events['start_date'])
         self.events['end_date'] = pd.to_datetime(self.events['end_date'])
         self.events['e_txt_id'] = 'SF11E' + self.events['id'].astype(int).astype(str).str.zfill(8)
@@ -100,20 +97,22 @@ class Export():
         if len(event_ids) == 1:
             event_ids = (event_ids[0], -9)
         q = 'SELECT fire_id, event_id FROM event_fires WHERE event_id IN %(eventids)s'
-        df = pd.read_sql(text(q %{'eventids': event_ids}), con=db.engine.connect())
+        df = db.read_sql(q % {'eventids': event_ids})
         return df
 
     def _get_event_days(self, db):
         '''
         Get the daily event date by location
         '''
-        q = """SELECT event_day.id, daily_area as area, event_date as date_time, event_id, ST_X(location) as longitude, \
-          ST_Y(location) as latitude FROM event_day JOIN event ON event.id = event_day.event_id \
+        q = """SELECT event_day.id, daily_area as area, event_date as date_time, event_id, location \
+          FROM event_day JOIN event ON event.id = event_day.event_id \
           WHERE event.reconciliationstream_id = %(streamid)s AND \
           event_date >= '%(startdate)s' AND event_date <= '%(enddate)s'"""
-        q = text(q %{'startdate': self.start_date, 'enddate': self.end_date, 
-          'streamid': self.stream_id})
-        df = pd.read_sql(q, con=db.engine.connect())
+        q = q % {'startdate': self.start_date, 'enddate': self.end_date,
+          'streamid': self.stream_id}
+        df = db.read_geodataframe(q, geom_col="location", crs="EPSG:4326")
+        df["longitude"] = df.geometry.x
+        df["latitude"] = df.geometry.y
         print(df.head())
         df['date_time'] = pd.to_datetime(df['date_time'])
         df['f_txt_id'] = 'SF11C' + df['id'].astype(int).astype(str).str.zfill(8)
@@ -130,15 +129,17 @@ class Export():
         else:
             events_str = ','.join([str(s) for s in events])
             wq = f'WHERE id IN ({events_str})'
-        q = """SELECT jsonb_build_object(\
-          'type', 'FeatureCollection','features', jsonb_agg(feature))\
-          FROM (SELECT jsonb_build_object('type', 'Feature','id', id, 'geometry',\
-          ST_AsGeoJSON(ST_Transform(outline_shape, 4326))::jsonb, 'properties', \
-          to_jsonb(row) - 'id' - 'outline_shape') AS feature\
-          FROM (SELECT * FROM event %(where_events)s) row) features"""
-        q = text(q %{'where_events': wq})
-        df = pd.read_sql(q, con=db.engine.connect())
-        return df.iloc[0]['jsonb_build_object']
+        df = db.read_geodataframe(
+            f"SELECT * FROM event {wq}", geom_col="outline_shape"
+        ).to_crs(epsg=4326)
+        for column in df.columns.drop("outline_shape"):
+            df[column] = df[column].map(
+                lambda value: value.isoformat()
+                if isinstance(value, (date, datetime))
+                else value
+            )
+        df = df.set_index("id", drop=True)
+        return json.loads(df.to_json())
 
     @staticmethod
     def _valid_polygon(
@@ -365,7 +366,7 @@ class Export():
 
         event_ids = ','.join(str(int(event_id)) for event_id in events)
         event_day = day.strftime('%Y-%m-%d')
-        query = text(f'''WITH daily_areas AS (
+        query = f'''WITH daily_areas AS (
           SELECT event_id,
             SUM(ROUND((daily_area / 4046.8564224)::numeric, 2)
               * 4046.8564224) AS daily_area,
@@ -378,21 +379,24 @@ class Export():
           event.start_date AS event_start_date, event.end_date AS event_end_date,
           event.fire_type AS fire_type, event.total_area AS event_area,
           event.outline_shape, daily_areas.event_day_id, daily_areas.daily_area,
-          ST_AsBinary(clump.shape) AS clump_wkb,
-          ST_X(event_day.location) AS longitude,
-          ST_Y(event_day.location) AS latitude
+          clump.shape AS clump_wkb, event_day.location
         FROM daily_areas
         JOIN event ON event.id = daily_areas.event_id
         JOIN event_day ON event_day.event_id = daily_areas.event_id
           AND event_day.event_date = '{event_day}'
-        LEFT JOIN clump ON clump.id = event_day.clump_id''')
-        with db.engine.connect() as conn:
-            daily_rows = cast(
-                gpd.GeoDataFrame,
-                gpd.read_postgis(
-                    query, con=conn, geom_col='outline_shape', chunksize=None
-                )
-            )
+        LEFT JOIN clump ON clump.id = event_day.clump_id'''
+        daily_rows = db.read_sql(query)
+        for column in ("outline_shape", "clump_wkb", "location"):
+            daily_rows[column] = daily_rows[column].map(db.decode_geometry)
+        daily_rows["longitude"] = daily_rows["location"].map(
+            lambda point: point.x
+        )
+        daily_rows["latitude"] = daily_rows["location"].map(
+            lambda point: point.y
+        )
+        daily_rows = gpd.GeoDataFrame(
+            daily_rows, geometry="outline_shape", crs=f"EPSG:{db.srid}"
+        )
         if daily_rows.empty:
             return {'type': 'FeatureCollection', 'features': []}
 
@@ -432,10 +436,8 @@ class Export():
             activity_shapes = []
             for row in rows.itertuples():
                 activity = None
-                if isinstance(row.clump_wkb, (bytes, bytearray, memoryview)):
-                    clump = self._valid_polygon(
-                        wkb.loads(bytes(row.clump_wkb))
-                    )
+                if isinstance(row.clump_wkb, BaseGeometry):
+                    clump = self._valid_polygon(row.clump_wkb)
                     if clump is not None:
                         activity = self._valid_polygon(
                             self._intersection(clump, outline)
@@ -527,7 +529,7 @@ class Export():
             fire_ids = (fire_ids[0], -9)
         q = 'SELECT fire.id as fire_id, source.name as sources FROM fire LEFT JOIN source ON \
           source.id = fire.source_id WHERE fire.id IN %(fireids)s'
-        fire_sources = pd.read_sql(text(q %{'fireids': fire_ids}), con=db.engine.connect())
+        fire_sources = db.read_sql(q % {'fireids': fire_ids})
         event_fires = event_fires.merge(fire_sources, on='fire_id')
         event_fires.drop_duplicates(['event_id','sources'], inplace=True)
         event_fires = event_fires.groupby('event_id')['sources'].apply(lambda x: ';'.join(x))
@@ -641,8 +643,8 @@ class Export():
             q = f'SELECT id as rawdata_id, clump_id, start_date FROM raw_data where source_id = {srcids[0]}'
         else:
             q = 'SELECT id as rawdata_id, clump_id, start_date FROM raw_data where source_id IN %(sourceids)s'
-            q = text(q %{'sourceids': srcids})
-        return pd.read_sql(q, con=db.engine.connect())
+            q = q % {'sourceids': srcids}
+        return db.read_sql(q)
 
     def _get_viirs_frp(self, db, rdids):
         '''
@@ -651,14 +653,16 @@ class Export():
         # Updated the raw data ID list only for VIIRS
         q = """SELECT rawdata_id FROM data_attribute \
           WHERE name = 'Method' AND attr_value = 'VIIRS' and rawdata_id IN %(rawids)s"""
-        q = text(q %{'rawids': rdids})
-        df = pd.read_sql(q, con=db.engine.connect())
+        q = q % {'rawids': rdids}
+        df = db.read_sql(q)
+        if df.empty:
+            return pd.DataFrame(columns=["frp", "clump_id", "rawdata_id"])
         # Get the FRP values for VIIRS
         q = """SELECT attr_value as frp, raw_data.clump_id, rawdata_id FROM data_attribute \
           LEFT JOIN raw_data ON data_attribute.rawdata_id = raw_data.id \
           WHERE name = 'FRP' AND rawdata_id IN %(rawids)s"""
-        q = text(q %{'rawids': tuple(df.rawdata_id.drop_duplicates())})
-        df = pd.read_sql(q, con=db.engine.connect())
+        q = q % {'rawids': tuple(df.rawdata_id.drop_duplicates())}
+        df = db.read_sql(q)
         df['frp'] = df['frp'].astype(float)
         return df[df['frp'] > 0].copy()
 
@@ -669,8 +673,8 @@ class Export():
         # Get the source IDs for the sources in this stream that have an hms clump method
         q = """SELECT source.id as source_id FROM source WHERE source.id IN %(sourceids)s AND \
           clump_method = 'hms'"""
-        q = text(q %{'sourceids': self.source_ids})
-        df = pd.read_sql(q, con=db.engine.connect())
+        q = q % {'sourceids': self.source_ids}
+        df = db.read_sql(q)
         sat_srcs = tuple(df.source_id.drop_duplicates())
         if len(sat_srcs) == 0:
             print('No satellite sources in stream. Nothing to do.')
@@ -681,8 +685,8 @@ class Export():
             # Get the fire IDs for the clumps
             q = 'SELECT id as clump_id, event_id FROM clump LEFT JOIN event_fires \
               ON clump.fire_id = event_fires.fire_id WHERE clump.id IN %(clumps)s'
-            q = text(q %{'clumps': tuple(detect_cnt.clump_id.drop_duplicates())})
-            cf_xref = pd.read_sql(q, con=db.engine.connect())
+            q = q % {'clumps': tuple(detect_cnt.clump_id.drop_duplicates())}
+            cf_xref = db.read_sql(q)
             # Sum up the number of detects per event_day
             detect_cnt = detect_cnt.merge(cf_xref, on='clump_id', how='left')
             idx = ['event_id','start_date']

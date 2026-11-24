@@ -1,8 +1,6 @@
 from math import pi
 import pandas as pd
 import geopandas as gpd
-from geoalchemy2 import Geometry
-from sqlalchemy import text
 
 class Ingest():
     '''
@@ -22,9 +20,7 @@ class Ingest():
             raise ValueError('Data policy requires value of append or replace')
 
     def _get_next_id(self, db):
-        with db.engine.connect() as conn:
-            result = conn.execute(text("SELECT nextval('raw_data_seq')"))
-        return int(result.first()[0])
+        return db.next_id("raw_data_seq")
 
     def insert_raw_data(self, db, source_id):
         '''
@@ -41,8 +37,9 @@ class Ingest():
         self.srid = int(db.srid)
         self._src.set_geometry('shape', inplace=True, crs='EPSG:%s' %self.srid)
         cols = ['id','area','end_date','shape','start_date','source_id']
-        dtype = {'shape': Geometry(geometry_type='POLYGON', srid=self.srid)}
-        self._src[cols].to_postgis(name='raw_data', con=db.engine, if_exists='append', index=False)#, dtype=dtype)
+        db.write_dataframe(
+            "raw_data", self._src[cols], geometry_columns=("shape",)
+        )
         srccols = [col for col in list(self._src.columns) if col not in cols]
         if len(srccols) > 1:
             srcatts = self._src[['id',] + srccols].copy()
@@ -51,7 +48,7 @@ class Ingest():
             srcatts.rename(columns={'id': 'rawdata_id'}, inplace=True)
             srcatts = pd.melt(srcatts, id_vars='rawdata_id', value_vars=srccols, var_name='name', 
               value_name='attr_value')
-            srcatts.to_sql(name='data_attribute', con=db.engine, if_exists='append', index=False)
+            db.write_dataframe("data_attribute", srcatts)
 
 class CSVIngest(Ingest):
     def __init__(self, config):

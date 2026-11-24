@@ -1,7 +1,6 @@
 from datetime import datetime, timedelta
 import pandas as pd
 import geopandas as gpd
-from sqlalchemy import text
 from . import Clump
 
 class HmsClump(Clump):

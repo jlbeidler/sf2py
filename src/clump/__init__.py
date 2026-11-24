@@ -6,7 +6,6 @@ from functools import partial
 import pandas as pd
 import geopandas as gpd
 from numpy import array_split
-from sqlalchemy import text
 from datetime import datetime
 
 class Clump():
@@ -21,9 +20,7 @@ class Clump():
             raise ValueError('Missing radius is config file')
 
     def _get_next_id(self, db):
-        with db.engine.connect() as conn:
-            result = conn.execute(text("SELECT nextval('clump_seq')"))
-        return result.first()[0]
+        return db.next_id("clump_seq")
 
     def _write_clump_data(self, db):
         '''
@@ -34,7 +31,7 @@ class Clump():
         self.clumps['id'] = seq
         cols = ['id','area','end_date','shape','start_date','source_id']
         self.clumps.set_geometry('shape', inplace=True, crs='EPSG:%s' %db.srid)
-        self.clumps[cols].to_postgis(name='clump', con=db.engine, if_exists='append', index=False)
+        db.write_dataframe("clump", self.clumps[cols], geometry_columns=("shape",))
 
     def _update_raw_id(self, db, source_id):
         '''
@@ -42,10 +39,9 @@ class Clump():
         '''
         self.srcmap.rename(columns={'id': 'clump_id'}, inplace=True)
         self.srcmap.rename(columns={'rawdata_id': 'id'}, inplace=True)
-        with db.engine.connect() as conn:
-            conn.execute(text("CREATE TEMP TABLE clumplist (id INTEGER, clump_id INTEGER) ON COMMIT DROP"))
-            self.srcmap.to_sql(name='clumplist', con=conn, if_exists='replace', index=False)
-            conn.execute(text("UPDATE raw_data SET clump_id = clumplist.clump_id FROM clumplist WHERE clumplist.id = raw_data.id"))
+        db.update_from_dataframe(
+            "raw_data", "clumplist", self.srcmap, "id", "clump_id", "clump_id"
+        )
 
     def _set_area():
         '''
@@ -66,9 +62,10 @@ class Clump():
         Default method to clump the raw data by single day in space with a clumping radius.
         Generally used for HMS satellite.
         '''
-        with db.engine.connect() as conn:
-            df = gpd.read_postgis(text("SELECT * from raw_data WHERE source_id = '%s'" %source_id),
-              con=conn, geom_col='shape')
+        df = db.read_geodataframe(
+            "SELECT * from raw_data WHERE source_id = '%s'" % source_id,
+            geom_col="shape",
+        )
         bar = Bar('Clumping', max=len(df['start_date'].drop_duplicates())) 
         self.srcmap = pd.DataFrame()
         # Loop through the days to identify which records spatially intersect to get clumps

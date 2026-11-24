@@ -6,7 +6,8 @@ from reconcile import *
 from exports import *
 
 config = sys.argv[1]
-db = DataBase('config/pg.json')
+database_config = sys.argv[2] if len(sys.argv) > 2 else 'config/pg.json'
+db = DataBase(database_config)
 a = Reconciliation(config, db)
 a.purge_events(db)
 a.reconcile(db)

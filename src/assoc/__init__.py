@@ -4,7 +4,6 @@ import uuid
 from datetime import timedelta
 import pandas as pd
 import geopandas as gpd
-from sqlalchemy import text
 
 class Association():
     '''
@@ -27,9 +26,7 @@ class Association():
         '''
         Get the next sequence value
         '''
-        with db.engine.connect() as conn:
-            result = conn.execute(text("SELECT nextval('fire_seq')"))
-        return result.first()[0]
+        return db.next_id("fire_seq")
 
     def _write_fire_data(self, db):
         '''
@@ -46,7 +43,7 @@ class Association():
         self.fires.set_geometry('shape', inplace=True, crs='EPSG:%s' %db.srid)
         # Really small buffer to fix geometries
         self.fires['shape'] = self.fires['shape'].buffer(0.00001)
-        self.fires[cols].to_postgis(name='fire', con=db.engine, if_exists='append', index=False)
+        db.write_dataframe("fire", self.fires[cols], geometry_columns=("shape",))
 
     def _update_clump_id(self, db, source_id):
         '''
@@ -54,10 +51,9 @@ class Association():
         '''
         self.srcmap.rename(columns={'id': 'fire_id'}, inplace=True)
         self.srcmap.rename(columns={'clump_id': 'id'}, inplace=True)
-        with db.engine.connect() as conn:
-            conn.execute(text("CREATE TEMP TABLE firelist (id INTEGER, fire_id INTEGER) ON COMMIT DROP"))
-            self.srcmap[['id','fire_id']].to_sql(name='firelist', con=conn, if_exists='replace', index=False)
-            conn.execute(text("UPDATE clump SET fire_id = firelist.fire_id FROM firelist WHERE firelist.id = clump.id"))
+        db.update_from_dataframe(
+            "clump", "firelist", self.srcmap, "id", "fire_id", "fire_id"
+        )
 
     def _write_fire_attributes(self, db):
         ['attr_value','name','fire_id']
@@ -68,9 +64,9 @@ class Association():
         '''
         Get the rawdata/clump ID table
         '''
-        with db.engine.connect() as conn:
-            df = pd.read_sql(text("SELECT id, clump_id FROM raw_data WHERE source_id = '%s'" %source_id), 
-              con=conn)
+        df = db.read_sql(
+            "SELECT id, clump_id FROM raw_data WHERE source_id = '%s'" % source_id
+        )
         df.rename(columns={'id': 'rawdata_id'}, inplace=True)
         return df
 
@@ -80,11 +76,10 @@ class Association():
         '''
         rawids = self._get_rawdata_id(db, source_id)
         rawid_list = tuple(rawids['rawdata_id'].drop_duplicates())
-        with db.engine.connect() as conn:
-            q = """SELECT rawdata_id, attr_value FROM data_attribute WHERE rawdata_id IN %(ids)s
-                AND name = 'fire_id'"""
-            q = text(q % {'ids': rawid_list})
-            fireids = pd.read_sql(q, con=conn)
+        q = """SELECT rawdata_id, attr_value FROM data_attribute WHERE rawdata_id IN %(ids)s
+            AND name = 'fire_id'"""
+        q = q % {'ids': rawid_list}
+        fireids = db.read_sql(q)
         fireids = pd.merge(rawids, fireids, on='rawdata_id', how='left')
         fireids = fireids[['clump_id','attr_value']].drop_duplicates('clump_id')
         fireids.rename(columns={'clump_id': 'id', 'attr_value': 'fire_id'}, inplace=True)
@@ -96,11 +91,10 @@ class Association():
         '''
         rawids = self._get_rawdata_id(db, source_id)
         rawid_list = tuple(rawids['rawdata_id'].drop_duplicates())
-        with db.engine.connect() as conn:
-            q = """SELECT rawdata_id, attr_value FROM data_attribute WHERE rawdata_id IN %(ids)s
-                AND name = '%(att_name)s'"""
-            q = text(q % {'ids': rawid_list, 'att_name': att_name})
-            firetype = pd.read_sql(q, con=conn)
+        q = """SELECT rawdata_id, attr_value FROM data_attribute WHERE rawdata_id IN %(ids)s
+            AND name = '%(att_name)s'"""
+        q = q % {'ids': rawid_list, 'att_name': att_name}
+        firetype = db.read_sql(q)
         df = pd.merge(self.srcmap[['clump_id','tmp_fire']], rawids, on='clump_id', how='left')
         firetype.rename(columns={'attr_value': att_name}, inplace=True)
         df = pd.merge(df, firetype, on='rawdata_id', how='left')
@@ -113,10 +107,12 @@ class Association():
         '''
         Set the start and end dates of the fire from the earliest clump start and the latest clump end 
         '''
-        with db.engine.connect() as conn:
-            df = pd.read_sql(text("SELECT id, start_date, end_date FROM clump WHERE source_id = '%s'" %source_id), con=conn)
-            df.rename(columns={'id': 'clump_id'}, inplace=True)
-            df = pd.merge(self.srcmap[['clump_id','tmp_fire']], df, on='clump_id', how='left')
+        df = db.read_sql(
+            "SELECT id, start_date, end_date FROM clump WHERE source_id = '%s'"
+            % source_id
+        )
+        df.rename(columns={'id': 'clump_id'}, inplace=True)
+        df = pd.merge(self.srcmap[['clump_id','tmp_fire']], df, on='clump_id', how='left')
         start_dates = df[['tmp_fire','start_date']].sort_values('start_date', ascending=False).drop_duplicates('tmp_fire', keep='last')
         end_dates = df[['tmp_fire','end_date']].sort_values('end_date', ascending=False).drop_duplicates('tmp_fire', keep='first')
         df = pd.merge(start_dates, end_dates, on='tmp_fire', how='outer')
@@ -159,9 +155,10 @@ class Association():
         '''
         Associate the clumps in space and time only. No buffering.
         '''
-        with db.engine.connect() as conn:
-            df = gpd.read_postgis(text("SELECT * from clump WHERE source_id = '%s'" %source_id),
-              con=conn, geom_col='shape')
+        df = db.read_geodataframe(
+            "SELECT * from clump WHERE source_id = '%s'" % source_id,
+            geom_col="shape",
+        )
         # Set back and forwards timedeltas
         back_days = timedelta(days=self.num_back_days)
         fwd_days = timedelta(days=self.num_forward_days)

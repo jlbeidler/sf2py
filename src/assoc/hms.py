@@ -2,7 +2,6 @@ from progress.bar import Bar
 from datetime import datetime, timedelta
 import pandas as pd
 import geopandas as gpd
-from sqlalchemy import text
 from . import Association
 
 class HmsAssoc(Association):
@@ -51,9 +50,10 @@ class HmsAssoc(Association):
         '''
         Associate the clumps
         '''
-        with db.engine.connect() as conn:
-            df = gpd.read_postgis(text("SELECT * from clump WHERE source_id = '%s'" %source_id),
-              con=conn, geom_col='shape')
+        df = db.read_geodataframe(
+            "SELECT * from clump WHERE source_id = '%s'" % source_id,
+            geom_col="shape",
+        )
         # Set back and forwards timedeltas
         back_days = timedelta(days=self.num_back_days)
         fwd_days = timedelta(days=self.num_forward_days)

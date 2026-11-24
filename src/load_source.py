@@ -6,7 +6,8 @@ from sources import DataSource
 from database import DataBase
 
 a = DataSource(sys.argv[1])
-db = DataBase('config/pg.json')
+database_config = sys.argv[2] if len(sys.argv) > 2 else 'config/pg.json'
+db = DataBase(database_config)
 a.write_source_tables(db, clobber=True)
 try:
     ingest_module = importlib.import_module('ingest.%s' %a.config['input']['ingest_method'].lower())

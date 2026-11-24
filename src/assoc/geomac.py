@@ -2,7 +2,6 @@ from progress.bar import Bar
 from datetime import datetime, timedelta
 import pandas as pd
 import geopandas as gpd
-from sqlalchemy import text
 from . import Association
 
 class GeomacAssoc(Association):
@@ -15,9 +14,10 @@ class GeomacAssoc(Association):
         Associate the clumps. GeoMac will associate both spatially and using unique fire identifier
           within the date range.
         '''
-        with db.engine.connect() as conn:
-            df = gpd.read_postgis(text("SELECT * from clump WHERE source_id = '%s'" %source_id),
-              con=conn, geom_col='shape')
+        df = db.read_geodataframe(
+            "SELECT * from clump WHERE source_id = '%s'" % source_id,
+            geom_col="shape",
+        )
         df.drop('fire_id', axis=1, inplace=True)
         # Get the fire IDs for the clumps
         fire_ids = self._get_fire_id(db, source_id)
