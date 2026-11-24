@@ -331,7 +331,7 @@ class Export():
           SELECT jsonb_build_object(
             'type', 'Feature',
             'id', event_id,
-            'geometry', ST_AsGeoJSON(ST_Transform(shape, 4326))::jsonb,
+            'geometry', ST_AsGeoJSON(ST_Transform(shape, 4326), 15)::jsonb,
             'properties', jsonb_build_object(
               'event_id', event_id,
               'f_txt_id', 'SF11C' || LPAD(event_day_id::text, 8, '0'),
@@ -340,8 +340,8 @@ class Export():
               'date', date,
               'event_start_date', event_start_date,
               'event_end_date', event_end_date,
-              'daily_area', ST_Area(shape) / 4046.8564224,
-              'daily_area_sqm', ST_Area(shape),
+              'daily_area', daily_area / 4046.8564224,
+              'daily_area_sqm', daily_area,
               'event_day_area_sqm', event_day_area,
               'event_area', ROUND((event_area / 4046.8564224)::numeric, 2)
             )
