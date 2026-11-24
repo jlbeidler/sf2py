@@ -353,7 +353,7 @@ class Export():
                     break
             return candidate
 
-        return None
+        return active_area
 
     def _get_daily_fire_extent_shape(
         self, events, day, db, previous_burned_area_by_event=None,
