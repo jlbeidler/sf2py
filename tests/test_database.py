@@ -8,7 +8,7 @@ import geopandas as gpd
 import pandas as pd
 from shapely.geometry import Point
 
-from src.database import DataBase
+from sf2py.database import DataBase
 
 
 @unittest.skipUnless(importlib.util.find_spec("ibis"), "Ibis is optional")
@@ -25,7 +25,8 @@ class DuckDBDatabaseTests(unittest.TestCase):
         self.db = DataBase(config_path)
         self.addCleanup(self.db.close)
         self.db.initialize_schema(
-            Path(__file__).parents[1] / "src" / "sql" / "duckdb_tables.sql"
+            Path(__file__).parents[1]
+            / "src" / "sf2py" / "sql" / "duckdb_tables.sql"
         )
 
     def test_round_trips_geometry_with_its_configured_crs(self):

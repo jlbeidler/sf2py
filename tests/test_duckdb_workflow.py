@@ -8,13 +8,13 @@ import geopandas as gpd
 import pandas as pd
 from shapely.geometry import box
 
-from src.assoc.geomac import GeomacAssoc
-from src.clump.geomac import GeomacClump
-from src.database import DataBase
-from src.exports import Export
-from src.ingest import Ingest
-from src.reconcile import Reconciliation
-from src.sources import DataSource
+from sf2py.assoc.geomac import GeomacAssoc
+from sf2py.clump.geomac import GeomacClump
+from sf2py.database import DataBase
+from sf2py.exports import Export
+from sf2py.ingest import Ingest
+from sf2py.reconcile import Reconciliation
+from sf2py.sources import DataSource
 
 
 @unittest.skipUnless(importlib.util.find_spec("ibis"), "Ibis is optional")
@@ -33,7 +33,8 @@ class DuckDBWorkflowTests(unittest.TestCase):
             db = DataBase(db_config)
             try:
                 db.initialize_schema(
-                    Path(__file__).parents[1] / "src" / "sql" / "duckdb_tables.sql"
+                    Path(__file__).parents[1]
+                    / "src" / "sf2py" / "sql" / "duckdb_tables.sql"
                 )
                 source_path = root / "source.json"
                 source_path.write_text(json.dumps({

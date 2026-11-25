@@ -3,7 +3,7 @@ import unittest
 
 import geopandas as gpd
 from shapely import wkb
-from exports import Export
+from sf2py.exports import Export
 from shapely.geometry import Point, Polygon, box, shape
 
 

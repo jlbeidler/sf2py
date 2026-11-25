@@ -13,4 +13,6 @@ dbname=sf2
 pguser=sf2
 host=localhost
 
-psql -U $pguser -h $host -W $dbname -f smartfire_tables.sql
+script_dir=$(cd "$(dirname "$0")" && pwd)
+psql -U "$pguser" -h "$host" -W "$dbname" \
+  -f "$script_dir/../src/sf2py/sql/smartfire_tables.sql"

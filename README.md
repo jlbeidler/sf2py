@@ -27,20 +27,18 @@ source data
 
 | Path | Purpose |
 | --- | --- |
-| `src/load_source.py` | Loads one source configuration and processes a source through ingest, clump, and association |
-| `src/reconcile_fires.py` | Purges overlapping stream events, reconciles the configured sources, and exports the result |
-| `src/purge_stream.py` | Purges events for a reconciliation stream/date range without reconciling or exporting |
-| `src/database.py` | Loads PostgreSQL/PostGIS or Ibis DuckDB settings and provides database operations |
-| `src/sources.py` | Writes source definitions and default reconciliation weights |
-| `src/ingest/` | CSV, ground-report, satellite, and shapefile ingestion implementations |
-| `src/clump/` | HMS, ICS, and perimeter/shapefile clumping implementations |
-| `src/assoc/` | HMS, ICS, and perimeter/shapefile association implementations |
-| `src/reconcile/` | Reconciliation logic and event/day table writes |
-| `src/exports/` | Daily BSF-style event/location export and satellite detection summaries |
-| `src/sql/` | PostGIS table, sequence, constraint, and SRID setup |
-| `src/config/pg.json` | PostgreSQL connection settings |
-| `src/config/duckdb.json` | Example local DuckDB database settings |
-| `src/sql/duckdb_tables.sql` | DuckDB schema using WKB blobs for geometry |
+| `setup.py` | Package metadata, dependencies, and installed command definitions |
+| `src/sf2py/cli.py` | Command-line workflows exposed after installation |
+| `src/sf2py/database.py` | PostgreSQL/PostGIS and Ibis DuckDB database operations |
+| `src/sf2py/sources.py` | Source definitions and default reconciliation weights |
+| `src/sf2py/ingest/` | CSV, ground-report, satellite, and shapefile ingestion implementations |
+| `src/sf2py/clump/` | HMS, ICS, and perimeter/shapefile clumping implementations |
+| `src/sf2py/assoc/` | HMS, ICS, and perimeter/shapefile association implementations |
+| `src/sf2py/reconcile/` | Reconciliation logic and event/day table writes |
+| `src/sf2py/exports/` | Daily BSF-style event/location export and satellite detection summaries |
+| `src/sf2py/sql/` | PostgreSQL and DuckDB schemas, included in the installed package |
+| `config/pg.json` | Local PostgreSQL connection settings (not included in the package) |
+| `config/duckdb.json` | Example local DuckDB database settings |
 | `examples/datasources/` | Example source configurations for HMS, NIFS, ICS-209, and other datasets |
 | `examples/streams/` | Example reconciliation stream configurations |
 | `examples/inputs/` | Small example input files |
@@ -50,22 +48,25 @@ source data
 
 ## Requirements
 
-The implementation requires:
-
-- Linux/Unix shell and Python 3
-- Shared Python packages: `SQLAlchemy`, `pandas`, `GeoPandas`, `numpy`, `progress`
-- PostgreSQL backend: PostgreSQL with PostGIS and `GeoAlchemy2`
-- DuckDB backend: DuckDB with Ibis (install `requirements-duckdb.txt`)
-- GIS support suitable for reading and writing the source formats (including Esri shapefiles)
-- `psql` for PostgreSQL database setup
-
-The DuckDB backend additionally requires Ibis with its DuckDB backend:
+The implementation requires Python 3.9 or newer. Install the package and the optional backend dependencies you need:
 
 ```bash
-pip install -r requirements-duckdb.txt
+python -m pip install .
+python -m pip install '.[postgres]'  # PostgreSQL/PostGIS support
+python -m pip install '.[duckdb]'    # DuckDB support
 ```
 
-The DuckDB requirements file installs the optional Ibis/DuckDB dependencies only. Install the shared Python packages and the dependencies for the selected database and input formats in your runtime environment.
+PostgreSQL itself must have PostGIS enabled, and `psql` is required for PostgreSQL schema setup. GIS support for selected input formats (including Esri shapefiles) must also be available.
+
+The package installs these command-line tools: `sf2py-load-source`, `sf2py-reconcile`, `sf2py-purge-stream`, `sf2py-export-fires`, and `sf2py-setup-duckdb`. Each command accepts a config file path. The load, reconcile, purge, and export commands accept an optional database-config path, defaulting to `config/pg.json` relative to the current working directory; `sf2py-setup-duckdb` requires a database-config path.
+
+The DuckDB extra installs Ibis with its DuckDB backend. Alternatively, install those optional dependencies from the repository file:
+
+```bash
+python -m pip install -r requirements-duckdb.txt
+```
+
+The DuckDB requirements file installs only the optional Ibis/DuckDB dependencies.
 
 ## Database setup
 
@@ -81,7 +82,7 @@ GRANT ALL ON DATABASE sf2 TO sf2;
 \q
 ```
 
-Configure [`src/config/pg.json`](src/config/pg.json) for the target database:
+Configure [`config/pg.json`](config/pg.json) for the target database:
 
 ```json
 {
@@ -97,21 +98,20 @@ Configure [`src/config/pg.json`](src/config/pg.json) for the target database:
 Create the schema from the repository:
 
 ```bash
-cd src/sql
-psql -U sf2 -h 127.0.0.1 sf2 -f smartfire_tables.sql
+psql -U sf2 -h 127.0.0.1 sf2 -f src/sf2py/sql/smartfire_tables.sql
 ```
 
 ### DuckDB setup
 
-The DuckDB configuration in [`src/config/duckdb.json`](src/config/duckdb.json) points to a local database file. From `src`, initialize the required tables and sequences with:
+The DuckDB configuration in [`config/duckdb.json`](config/duckdb.json) points to a local database file. Initialize the required tables and sequences with:
 
 ```bash
-python3 setup_duckdb.py config/duckdb.json
+sf2py-setup-duckdb config/duckdb.json
 ```
 
 Geometry is stored as WKB in DuckDB; clumping, association, and reconciliation continue to use GeoPandas/Shapely for spatial processing. No PostGIS extension is required for DuckDB.
 
-The PostgreSQL SQL defaults to EPSG 5070 for source, clump, fire, and event shapes and EPSG 4326 for event-day locations. Change the SRID definitions consistently in [`smartfire_tables.sql`](src/sql/smartfire_tables.sql) and `pg.json` if the study area requires a different projected CRS.
+The PostgreSQL SQL defaults to EPSG 5070 for source, clump, fire, and event shapes and EPSG 4326 for event-day locations. Change the SRID definitions consistently in [`smartfire_tables.sql`](src/sf2py/sql/smartfire_tables.sql) and `config/pg.json` if the study area requires a different projected CRS.
 
 ## Prepare activity data
 
@@ -197,17 +197,16 @@ During reconciliation, larger uncertainty buffers find more potential matches, w
 
 ## Load a source
 
-Run the source loader from the `src` directory so its relative imports and `config/pg.json` path resolve:
+Run the installed source loader:
 
 ```bash
-cd src
-python3 load_source.py ../examples/datasources/nifs_2020.json
+sf2py-load-source examples/datasources/nifs_2020.json
 ```
 
 The optional second argument selects a database configuration. Existing commands default to PostgreSQL; pass `config/duckdb.json` to use DuckDB:
 
 ```bash
-python3 load_source.py ../examples/datasources/nifs_2020.json config/duckdb.json
+sf2py-load-source examples/datasources/nifs_2020.json config/duckdb.json
 ```
 
 The loader:
@@ -250,11 +249,10 @@ Regional examples are under [`examples/streams/`](examples/streams/).
 ## Reconcile and export
 
 ```bash
-cd src
-python3 reconcile_fires.py ../examples/streams/nei2020_v1.json
+sf2py-reconcile examples/streams/nei2020_v1.json
 ```
 
-Pass `config/duckdb.json` as the second argument to reconcile against DuckDB. The same optional argument is supported by `purge_stream.py` and `export_fires.py`.
+Pass `config/duckdb.json` as the second argument to reconcile against DuckDB. The same optional argument is supported by `sf2py-purge-stream` and `sf2py-export-fires`.
 
 The reconciliation phase:
 
@@ -278,8 +276,7 @@ The event CSV contains event ID, name, stream name, dates, total area in acres, 
 To remove reconciled event data for a stream/date range without rerunning reconciliation or export:
 
 ```bash
-cd src
-python3 purge_stream.py ../examples/streams/nei2020_v1.json
+sf2py-purge-stream examples/streams/nei2020_v1.json
 ```
 
 This deletes matching rows from `event_fires`, `event_day`, and `event` for the stream. Source fires and source-level raw/clump/fire data remain intact, so the stream can be rerun after correction.

@@ -71,8 +71,8 @@ class Clump():
         # Loop through the days to identify which records spatially intersect to get clumps
         for day in list(df['start_date'].drop_duplicates()):
             today = df[df['start_date'] == day].copy()
-            # Buffer the shapes by the configured radius -- cap_style=3 makes these a square
-            today['shape'] = today['shape'].buffer(self.radius, resolution=8, cap_style=3)
+            buffered = today[['shape', 'id']].copy()
+            buffered['shape'] = buffered['shape'].buffer(self.radius)
             ovr_res = []
             clump_intersect = partial(self._intersect, total=today[['shape','id']])
             # Set the number of processes, 4 seems like a good balance
@@ -80,7 +80,7 @@ class Clump():
             if len(today) < n_proc:
                 n_proc = len(today)
             with Pool(n_proc) as pool:
-                for res in pool.map(clump_intersect, array_split(today[['shape','id']], n_proc)):
+                for res in pool.map(clump_intersect, array_split(buffered, n_proc)):
                     ovr_res.append(res)
             pool.close()
             today_ovr = pd.concat(ovr_res).drop_duplicates()
@@ -103,12 +103,13 @@ class Clump():
         cols = ['id','start_date','end_date','shape']
         # Merge in the clump IDs from the daily intersection table
         self.clumps = df[cols].merge(self.srcmap[['id','tmp_clump']], on='id', how='left')
-        # Buffer the shapes by the configured radius
-        self.clumps['shape'] = self.clumps['shape'].buffer(self.radius, resolution=24)
         self.srcmap.rename(columns={'id': 'rawdata_id'}, inplace=True)
         # Dissolve the clumps
         self.clumps = gpd.GeoDataFrame(self.clumps, 
-          geometry='shape').dissolve(by='tmp_clump')
+          geometry='shape').dissolve(by='tmp_clump', as_index=False)
+        self.clumps['shape'] = self.clumps['shape'].envelope.buffer(
+            self.radius, resolution=24
+        )
         self.clumps['source_id'] = source_id
         self._set_area()
         self._write_clump_data(db)
