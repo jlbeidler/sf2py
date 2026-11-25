@@ -1,11 +1,10 @@
 import os.path
 import json
 from datetime import timedelta, datetime
-from typing import Any, Callable, Optional, cast
+from typing import Any, Callable, List, Optional, cast
 import geopandas as gpd
 import pandas as pd
 from shapely import wkb
-from shapely.affinity import scale as scale_geometry
 from shapely.errors import GEOSException
 from shapely.geometry import Point
 from shapely.geometry.base import BaseGeometry
@@ -234,158 +233,155 @@ class Export():
     ) -> Optional[BaseGeometry]:
         return cls._overlay(first, second, lambda left, right: left.difference(right))
 
+    @staticmethod
+    def _daily_target_area(
+        outline_area: float,
+        daily_area: float,
+        event_area: float,
+        total_daily_area: float,
+    ) -> float:
+        '''Convert a daily area share to the final event polygon's area units.'''
+        denominator = max(event_area, total_daily_area)
+        if daily_area <= 0 or denominator <= 0:
+            return 0.0
+        return outline_area * daily_area / denominator
+
     @classmethod
-    def _clean_daily_shape(
-        cls, geometry: Optional[BaseGeometry], available: BaseGeometry
+    def _simplify_daily_shape(
+        cls, geometry: BaseGeometry
     ) -> Optional[BaseGeometry]:
-        geometry = cls._valid_polygon(geometry)
-        if geometry is None:
-            return None
-        simplified = cls._valid_polygon(
-            geometry.simplify(cls.DAILY_SHAPE_SIMPLIFY_METERS, preserve_topology=True)
+        return cls._valid_polygon(
+            geometry.simplify(
+                cls.DAILY_SHAPE_SIMPLIFY_METERS, preserve_topology=True
+            )
         )
-        if simplified is None:
-            return None
-        parts = list(simplified.geoms) if simplified.geom_type == 'MultiPolygon' else [simplified]
-        substantial_parts = [
-            part for part in parts if part.area >= cls.MIN_DAILY_PART_AREA_SQM
-        ]
-        if not substantial_parts:
-            substantial_parts = [max(parts, key=lambda part: part.area)]
-        return cls._valid_polygon(unary_union(substantial_parts))
-
-    area_tolerance = 0.01
-    MAX_DAILY_OVERLAP_RATIO = 0.10
-    MAX_EVENT_EXTENSION_RATIO = 0.10
-
-    @classmethod
-    def _daily_shape_within_tolerances(
-        cls,
-        polygon: BaseGeometry,
-        event_polygon: BaseGeometry,
-        target_area: float,
-        previous_burned_area: Optional[BaseGeometry] = None,
-    ) -> bool:
-        outside = cls._difference(polygon, event_polygon)
-        if outside is None:
-            return False
-        allowed_extension = target_area * cls.MAX_EVENT_EXTENSION_RATIO
-        if outside.area > allowed_extension + cls.area_tolerance:
-            return False
-        if previous_burned_area is not None:
-            overlap = cls._intersection(polygon, previous_burned_area)
-            if overlap is None:
-                return False
-            allowed_overlap = target_area * cls.MAX_DAILY_OVERLAP_RATIO
-            if overlap.area > allowed_overlap + cls.area_tolerance:
-                return False
-        return True
 
     @classmethod
     def _allocate_daily_shape(
         cls,
-        activity: BaseGeometry,
+        seed_points: List[Point],
         available: BaseGeometry,
         target_area: float,
-        previous_burned_area: Optional[BaseGeometry] = None,
+        seed_weights: Optional[List[float]] = None,
     ) -> Optional[BaseGeometry]:
-        '''Allocate area nearest to the original daily activity geometry.'''
-        active_area = cls._clean_daily_shape(
-            cls._intersection(activity, available), available
+        '''Allocate the nearest available area around daily clump centers.'''
+        available = cls._valid_polygon(available)
+        if available is None or target_area <= 0:
+            return None
+        if target_area >= available.area:
+            return cls._simplify_daily_shape(available)
+
+        if seed_weights is not None and len(seed_weights) != len(seed_points):
+            raise ValueError('seed_weights must match seed_points')
+        seeds_and_weights = [
+            (point, seed_weights[index] if seed_weights is not None else 1.0)
+            for index, point in enumerate(seed_points)
+            if not point.is_empty
+        ]
+        seeds_and_weights = [
+            (point, weight) for point, weight in seeds_and_weights if weight > 0
+        ]
+        if not seeds_and_weights:
+            seeds_and_weights = [(available.representative_point(), 1.0)]
+        mean_weight = sum(weight for _, weight in seeds_and_weights) / len(
+            seeds_and_weights
         )
-        if active_area is not None and active_area.area >= target_area - cls.area_tolerance:
-            factor = (target_area / active_area.area) ** 0.5
-            scaled_area = cls._valid_polygon(scale_geometry(
-                active_area, factor, factor, origin=active_area.centroid
-            ))
-            scaled_area = cls._clean_daily_shape(scaled_area, available)
-            if (
-                scaled_area is not None
-                and scaled_area.area >= target_area - cls.area_tolerance
-                and cls._daily_shape_within_tolerances(
-                    scaled_area, available, target_area, previous_burned_area
-                )
-            ):
-                return scaled_area
+        weighted_seeds = [
+            (point, (weight / mean_weight) ** 0.5)
+            for point, weight in seeds_and_weights
+        ]
 
-        def nearby_area(distance):
-            return cls._clean_daily_shape(
-                activity.buffer(distance), available
+        min_x, min_y, max_x, max_y = available.bounds
+        diagonal = ((max_x - min_x) ** 2 + (max_y - min_y) ** 2) ** 0.5
+        high = max(
+            1.0,
+            max(
+                (seed.distance(available) + diagonal) / radius_factor
+                for seed, radius_factor in weighted_seeds
+            ) * 1.01,
+        )
+
+        def nearby_area(distance: float) -> Optional[BaseGeometry]:
+            buffers = unary_union([
+                seed.buffer(distance * radius_factor)
+                for seed, radius_factor in weighted_seeds
+            ])
+            opened = cls._valid_polygon(
+                buffers.buffer(-cls.MIN_DAILY_SHAPE_WIDTH_METERS / 2.0)
+                .buffer(cls.MIN_DAILY_SHAPE_WIDTH_METERS / 2.0)
+            )
+            if opened is not None:
+                buffers = opened
+            candidate = cls._valid_polygon(
+                cls._intersection(buffers, available)
+            )
+            return (
+                cls._simplify_daily_shape(candidate)
+                if candidate is not None else None
             )
 
-        low, high = 0.0, 1.0
-        candidate = nearby_area(high)
-        if candidate is None or candidate.area < target_area - cls.area_tolerance:
-            for _ in range(20):
-                low, high = high, high * 2.0
-                candidate = nearby_area(high)
-                if (
-                    candidate is not None
-                    and candidate.area >= target_area - cls.area_tolerance
-                    and cls._daily_shape_within_tolerances(
-                        candidate, available, target_area, previous_burned_area
-                    )
-                ):
-                    break
-        if (
-            candidate is not None
-            and candidate.area >= target_area - cls.area_tolerance
-            and cls._daily_shape_within_tolerances(
-                candidate, available, target_area, previous_burned_area
-            )
-        ):
-            for _ in range(15):
-                distance = (low + high) / 2.0
-                expanded = nearby_area(distance)
-                if (
-                    expanded is not None
-                    and expanded.area >= target_area - cls.area_tolerance
-                    and cls._daily_shape_within_tolerances(
-                        expanded, available, target_area, previous_burned_area
-                    )
-                ):
-                    high, candidate = distance, expanded
-                    if candidate.area <= target_area + cls.area_tolerance:
-                        break
-                else:
-                    low = distance
-                if high - low <= max(1e-8, high * 1e-12):
-                    break
-            return candidate
+        full_area = nearby_area(high)
+        if full_area is None:
+            return None
 
-        return active_area
+        low = 0.0
+        best = full_area
+        best_area_error = abs(full_area.area - target_area)
+        for _ in range(48):
+            distance = (low + high) / 2.0
+            candidate = nearby_area(distance)
+            if candidate is None:
+                low = distance
+                continue
+            area_error = abs(candidate.area - target_area)
+            if area_error < best_area_error:
+                best, best_area_error = candidate, area_error
+            if candidate.area >= target_area:
+                high = distance
+            else:
+                low = distance
+
+        return best
 
     def _get_daily_fire_extent_shape(
-        self, events, day, db, previous_burned_area_by_event=None,
-        multi_day_event_ids=None
+        self, events, day, db, previous_burned_area_by_event=None
     ):
-        '''Build daily event polygons from clumps and allocate prior-day overlap.'''
+        '''Allocate each day's share of an event polygon around its clump centers.'''
         if not events:
             return {'type': 'FeatureCollection', 'features': []}
 
         event_ids = ','.join(str(int(event_id)) for event_id in events)
         event_day = day.strftime('%Y-%m-%d')
         query = text(f'''WITH daily_areas AS (
-          SELECT event_id,
+          SELECT event_id, event_date,
             SUM(ROUND((daily_area / 4046.8564224)::numeric, 2)
               * 4046.8564224) AS daily_area,
             MIN(id) AS event_day_id
           FROM event_day
-          WHERE event_id IN ({event_ids}) AND event_date = '{event_day}'
+          WHERE event_id IN ({event_ids})
+          GROUP BY event_id, event_date
+        ), event_daily_totals AS (
+          SELECT event_id, SUM(daily_area) AS total_daily_area
+          FROM daily_areas
           GROUP BY event_id
         )
         SELECT event.id AS event_id, event.display_name AS event_name,
           event.start_date AS event_start_date, event.end_date AS event_end_date,
           event.fire_type AS fire_type, event.total_area AS event_area,
           event.outline_shape, daily_areas.event_day_id, daily_areas.daily_area,
+          event_daily_totals.total_daily_area,
           ST_AsBinary(clump.shape) AS clump_wkb,
+          event_day.daily_area AS clump_daily_area,
           ST_X(event_day.location) AS longitude,
           ST_Y(event_day.location) AS latitude
         FROM daily_areas
         JOIN event ON event.id = daily_areas.event_id
+        JOIN event_daily_totals
+          ON event_daily_totals.event_id = daily_areas.event_id
         JOIN event_day ON event_day.event_id = daily_areas.event_id
-          AND event_day.event_date = '{event_day}'
-        LEFT JOIN clump ON clump.id = event_day.clump_id''')
+          AND event_day.event_date = daily_areas.event_date
+        LEFT JOIN clump ON clump.id = event_day.clump_id
+        WHERE daily_areas.event_date = '{event_day}' ''')
         with db.engine.connect() as conn:
             daily_rows = cast(
                 gpd.GeoDataFrame,
@@ -405,91 +401,92 @@ class Export():
                 continue
             crs = cast(Any, daily_rows.crs)
             outline_geo = None
-
-            track_previous_area = (
-                previous_burned_area_by_event is not None
-                and multi_day_event_ids is not None
-                and event_id in multi_day_event_ids
+            previous = (
+                previous_burned_area_by_event.get(event_id)
+                if previous_burned_area_by_event is not None else None
             )
-            cumulative_burned_area = None
-            burned_area = None
-            if track_previous_area:
-                previous = previous_burned_area_by_event.get(event_id)
-                if previous is not None:
-                    previous_crs, cumulative_burned_area = previous
-                    if previous_crs != crs:
-                        cumulative_burned_area = self._project_geometry(
-                            cumulative_burned_area, previous_crs, crs
-                        )
-                    cumulative_burned_area = self._valid_polygon(
-                        cumulative_burned_area
-                    )
-                    if cumulative_burned_area is not None:
-                        burned_area = self._valid_polygon(
-                            self._intersection(cumulative_burned_area, outline)
-                        )
             available = outline
-            activity_shapes = []
+            previous_area = None
+            if previous is not None:
+                previous_crs, previous_area = previous
+                if previous_crs != crs:
+                    previous_area = self._project_geometry(
+                        previous_area, previous_crs, crs
+                    )
+                available = self._valid_polygon(
+                    self._difference(outline, previous_area)
+                )
+                if available is None:
+                    continue
+
+            seed_points = []
+            seed_daily_areas: List[float] = []
             for row in rows.itertuples():
-                activity = None
+                clump_daily_area = float(str(row.clump_daily_area))
+                clump = None
                 if isinstance(row.clump_wkb, (bytes, bytearray, memoryview)):
                     clump = self._valid_polygon(
                         wkb.loads(bytes(row.clump_wkb))
                     )
-                    if clump is not None:
-                        activity = self._valid_polygon(
-                            self._intersection(clump, outline)
-                        )
-                if activity is None:
-                    point = Point(float(str(row.longitude)), float(str(row.latitude)))
-                    if outline_geo is None:
-                        outline_geo = self._valid_polygon(
-                            self._project_geometry(outline, crs, 4326)
-                        )
-                    if outline_geo is None:
+                    if clump is not None and not clump.centroid.is_empty:
+                        seed_points.append(clump.centroid)
+                        seed_daily_areas.append(clump_daily_area)
                         continue
-                    if outline_geo.covers(point):
-                        point = self._project_geometry(point, 4326, crs)
-                    else:
-                        point = outline.representative_point()
-                    activity = self._valid_polygon(
-                        self._intersection(point.buffer(1.0), outline)
+                point = Point(float(str(row.longitude)), float(str(row.latitude)))
+                if outline_geo is None:
+                    outline_geo = self._valid_polygon(
+                        self._project_geometry(outline, crs, 4326)
                     )
-                if activity is not None:
-                    activity_shapes.append(activity)
-            if not activity_shapes:
-                continue
+                if outline_geo is None:
+                    continue
+                if outline_geo.covers(point):
+                    point = self._project_geometry(point, 4326, crs)
+                else:
+                    point = outline.representative_point()
+                seed_points.append(point)
+                seed_daily_areas.append(clump_daily_area)
 
-            activity = self._valid_polygon(unary_union(activity_shapes))
-            if activity is None:
-                continue
-            target_area = float(str(event['daily_area']))
+            known_weights = [
+                weight for weight in seed_daily_areas if weight > 0
+            ]
+            fallback_weight = (
+                sum(known_weights) / len(known_weights) if known_weights else 1.0
+            )
+            seed_weights = [
+                weight if weight > 0 else fallback_weight
+                for weight in seed_daily_areas
+            ]
+            daily_area = float(str(event['daily_area']))
+            total_daily_area = float(str(event['total_daily_area']))
+            event_area = float(str(event['event_area']))
+            target_area = self._daily_target_area(
+                outline.area, daily_area, event_area, total_daily_area
+            )
             if target_area <= 0:
                 continue
             polygon = self._allocate_daily_shape(
-                activity, available, target_area, burned_area
+                seed_points, available, target_area, seed_weights
             )
             if polygon is None or polygon.is_empty:
                 continue
-            if track_previous_area:
-                cumulative_burned_area = (
-                    polygon if cumulative_burned_area is None else self._overlay(
-                        cumulative_burned_area,
-                        polygon,
-                        lambda left, right: left.union(right)
-                    )
+            cumulative_burned_area = (
+                polygon if previous_area is None else self._overlay(
+                    previous_area, polygon,
+                    lambda left, right: left.union(right)
                 )
-                cumulative_burned_area = self._valid_polygon(
-                    cumulative_burned_area
+            )
+            cumulative_burned_area = self._valid_polygon(cumulative_burned_area)
+            if cumulative_burned_area is not None:
+                if previous_burned_area_by_event is None:
+                    previous_burned_area_by_event = {}
+                previous_burned_area_by_event[event_id] = (
+                    crs, cumulative_burned_area
                 )
-                if cumulative_burned_area is not None:
-                    previous_burned_area_by_event[event_id] = (
-                        crs, cumulative_burned_area
-                    )
             geojson_geometry = self._project_geometry(
                 polygon, crs, 4326
             ).__geo_interface__
-            acres = target_area / self.ACRES_TO_SQM
+            allocated_area = polygon.area
+            acres = allocated_area / self.ACRES_TO_SQM
             features.append({
                 'type': 'Feature',
                 'id': int(str(event_id)),
@@ -507,8 +504,8 @@ class Export():
                         event['event_end_date']
                     ).strftime('%Y-%m-%d'),
                     'daily_area': round(acres, 2),
-                    'daily_area_sqm': target_area,
-                    'event_day_area_sqm': target_area,
+                    'daily_area_sqm': allocated_area,
+                    'event_day_area_sqm': daily_area,
                     'event_area': round(
                         float(str(event['event_area'])) / self.ACRES_TO_SQM, 2
                     )
@@ -535,7 +532,7 @@ class Export():
 
     ACRES_TO_SQM = 4046.8564224
     DAILY_SHAPE_SIMPLIFY_METERS = 1.0
-    MIN_DAILY_PART_AREA_SQM = 400.0
+    MIN_DAILY_SHAPE_WIDTH_METERS = 2.0
     def _write_events(self, df, fn):
         '''
         Write the BSF-style events file
@@ -612,13 +609,9 @@ class Export():
 
     def export_daily_fire_extents(self, db):
         '''
-        Export event polygons scaled to daily area and aligned with daily activity
+        Allocate non-overlapping daily shares of each final event polygon.
         '''
         event_days = self._get_event_days(db)
-        multi_day_event_ids = set(
-            event_days.groupby('event_id')['date_time'].nunique()
-            .loc[lambda counts: counts > 1].index
-        )
         previous_burned_area_by_event = {}
         for day in list(pd.date_range(self.start_date, self.end_date)):
             day_str = datetime.strftime(day, '%Y%m%d')
@@ -628,8 +621,7 @@ class Export():
             print(f'Exporting {len(day_event_ids)} fire extents for {day_str}')
             if not day_event_ids.empty:
                 daily_shapes = self._get_daily_fire_extent_shape(
-                  list(day_event_ids), day, db, previous_burned_area_by_event,
-                  multi_day_event_ids)
+                  list(day_event_ids), day, db, previous_burned_area_by_event)
                 shp_fn = f'fire_daily_{day_str}.json'
                 self._write_shapes(daily_shapes, shp_fn)
 
